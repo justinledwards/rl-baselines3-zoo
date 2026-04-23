@@ -4,12 +4,12 @@ from rl_zoo3.callbacks import NESSMBTrainingStatsCallback
 
 hyperparams = {
     "NES-SMB-v0": dict(
-        policy="CnnPolicy",
+        policy="CnnLstmPolicy",
         n_envs=1,
         n_timesteps=500000.0,
-        frame_stack=8,
-        n_steps=1024,
-        batch_size=256,
+        frame_stack=4,
+        n_steps=512,
+        batch_size=128,
         n_epochs=4,
         learning_rate="lin_2.5e-4",
         gamma=0.99,

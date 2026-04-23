@@ -263,7 +263,12 @@ class NESSMBTrainingStatsCallback(BaseCallback):
     def _button_tokens(action_name: str) -> tuple[str, ...]:
         if not action_name or action_name == "noop":
             return ()
-        return tuple(token.lower() for token in action_name.split("_"))
+        allowed_tokens = {"right", "left", "down", "up", "a", "b"}
+        return tuple(
+            token
+            for token in (part.lower() for part in action_name.split("_"))
+            if token in allowed_tokens
+        )
 
     def _on_step(self) -> bool:
         for info in self.locals["infos"]:

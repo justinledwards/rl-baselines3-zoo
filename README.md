@@ -68,6 +68,8 @@ Common local tasks:
 - `mise run type` runs mypy
 - `mise run build` builds source and wheel distributions
 - `mise run train-nes-watch` runs the local visible `nes-py` SMB PPO trainer on `mps`
+- `mise run train-nes-watch-lstm` runs the local visible `nes-py` SMB `ppo_lstm` trainer on `mps`
+- `mise run train-nes-watch-lstm-cpu` runs the local visible `nes-py` SMB `ppo_lstm` trainer on `cpu`
 
 ### Local `nes-py` SMB training
 
@@ -78,10 +80,28 @@ The default visible training task uses the bundled known-good SMB reference ROM 
 mise run train-nes-watch
 ```
 
+To test recurrent PPO with `CnnLstmPolicy` on the same setup:
+
+```bash
+mise run train-nes-watch-lstm
+```
+
+If `ppo_lstm` is unstable on MPS on your Mac, use the CPU variant:
+
+```bash
+mise run train-nes-watch-lstm-cpu
+```
+
 There is also a sibling-ROM variant:
 
 ```bash
 mise run train-nes-watch-sibling-rom
+```
+
+And the equivalent sibling-ROM LSTM variant:
+
+```bash
+mise run train-nes-watch-lstm-sibling-rom
 ```
 
 At the moment, `/Users/justinedwards/git/NES-SMB-RL/rom/Super Mario Bros.nes` is not accepted by `nes-py` on this machine, so the default watch task intentionally points at the bundled reference ROM instead.

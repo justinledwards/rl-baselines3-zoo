@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -23,6 +25,7 @@ BUTTON_DOWN = 0b00100000
 BUTTON_START = 0b00001000
 BUTTON_B = 0b00000010
 BUTTON_A = 0b00000001
+BUTTON_TOKENS = frozenset({"right", "left", "down", "up", "a", "b", "noop"})
 
 SLIM_ACTIONS: tuple[tuple[str, tuple[str, ...], int], ...] = (
     ("noop", ("NOOP",), BUTTON_NOOP),
@@ -40,14 +43,37 @@ SLIM_ACTIONS: tuple[tuple[str, tuple[str, ...], int], ...] = (
     ("left_a_b", ("left", "A", "B"), BUTTON_LEFT | BUTTON_A | BUTTON_B),
 )
 
+LONG_JUMP_ACTIONS: tuple[tuple[str, tuple[str, ...], int], ...] = (
+    ("right_a_long", ("right", "A"), BUTTON_RIGHT | BUTTON_A),
+    ("right_a_b_long", ("right", "A", "B"), BUTTON_RIGHT | BUTTON_A | BUTTON_B),
+    ("left_a_long", ("left", "A"), BUTTON_LEFT | BUTTON_A),
+    ("left_a_b_long", ("left", "A", "B"), BUTTON_LEFT | BUTTON_A | BUTTON_B),
+)
+
+
+@dataclass(frozen=True)
+class ActionSpec:
+    name: str
+    buttons: tuple[str, ...]
+    sequence: tuple[int, ...]
+
+    @property
+    def uses_jump(self) -> bool:
+        return any(mask & BUTTON_A for mask in self.sequence)
+
 
 @dataclass(frozen=True)
 class SMBRamAddresses:
+    player_float_state: int = 0x001D
+    player_x_speed: int = 0x0057
     player_page: int = 0x006D
     player_x: int = 0x0086
+    player_y_screen: int = 0x00CE
     player_x_screen: int = 0x0755
     player_state: int = 0x000E
     player_mode: int = 0x000F
+    enemy_drawn: tuple[int, ...] = (0x000F, 0x0010, 0x0011, 0x0012, 0x0013)
+    enemy_states: tuple[int, ...] = (0x001E, 0x001F, 0x0020, 0x0021, 0x0022)
     lives: int = 0x075A
     screen_scroll: int = 0x071C
     camera_x: int = 0x073F
@@ -66,20 +92,49 @@ class RewardConfig:
     progress_scale: float = 1.0 / 12.0
     time_penalty: float = 0.01
     death_penalty: float = 25.0
+    airborne_death_penalty: float = 20.0
     flag_bonus: float = 500.0
     coin_bonus: float = 1.0
+    powerup_bonus: float = 20.0
     stagnation_penalty: float = 1.0
     stagnation_steps: int = 240
+    stagnation_window: int = 48
+    stagnation_min_progress: int = 24
     death_states: tuple[int, ...] = (6, 11)
     time_progress_weight: float = 0.001
+    jump_penalty_window: int = 32
+    jump_penalty_threshold: int = 12
+    jump_penalty_scale: float = 0.02
+    jump_no_progress_penalty: float = 0.08
+    jump_idle_penalty: float = 0.12
+    jump_start_penalty: float = 0.3
+    run_ground_bonus: float = 0.04
+    min_jump_speed: float = 24.0
+    min_run_steps: int = 6
+    short_jump_penalty: float = 0.06
+    short_jump_height_threshold: int = 10
+    good_jump_bonus: float = 0.12
+    good_jump_height_threshold: int = 14
+    good_jump_progress_threshold: int = 12
+    landing_spot_bonus: float = 0.08
+    landing_y_change_threshold: int = 6
+    landing_progress_threshold: int = 12
+    hop_cluster_penalty_scale: float = 0.16
+    hop_cluster_count_threshold: int = 4
+    hop_cluster_progress_threshold: int = 24
+    stomp_bonus: float = 3.0
 
 
 @dataclass(frozen=True)
 class SMBRamMetrics:
+    float_state: int
+    airborne: bool
+    x_speed: int
     player_state: int
     player_mode: int
     player_page: int
     player_x: int
+    player_y_screen: int
     player_x_screen: int
     screen_scroll: int
     camera_x: int
@@ -93,6 +148,8 @@ class SMBRamMetrics:
     progress: int
     level_progress: int
     campaign_progress: int
+    enemy_drawn: tuple[int, ...]
+    enemy_states: tuple[int, ...]
 
     @property
     def world_display(self) -> int:
@@ -110,8 +167,12 @@ class SMBRamMetrics:
             "level_display": self.level_display,
             "player_state": self.player_state,
             "player_mode": self.player_mode,
+            "float_state": self.float_state,
+            "airborne": int(self.airborne),
+            "x_speed": self.x_speed,
             "player_page": self.player_page,
             "player_x": self.player_x,
+            "player_y_screen": self.player_y_screen,
             "player_x_screen": self.player_x_screen,
             "screen_scroll": self.screen_scroll,
             "camera_x": self.camera_x,
@@ -132,24 +193,32 @@ class RewardTransition:
     reward_parts: dict[str, float]
     stagnation_steps: int
     level_complete: bool
+    jump_window_count: int
+    stagnation_window_gain: int
 
 
 def build_metrics_from_ram(ram: np.ndarray, addresses: SMBRamAddresses | None = None) -> SMBRamMetrics:
     addr = addresses or SMBRamAddresses()
+    float_state = int(ram[addr.player_float_state])
     player_page = int(ram[addr.player_page])
     player_x = int(ram[addr.player_x])
+    player_y_screen = int(ram[addr.player_y_screen])
     player_x_screen = int(ram[addr.player_x_screen])
     world = int(ram[addr.world])
     level = int(ram[addr.level_dash])
     progress = player_page * SCREEN_WIDTH + player_x
-    level_progress = player_page * SCREEN_WIDTH + player_x_screen
+    level_progress = progress
     timer = int(ram[addr.timer_digit_1]) * 100 + int(ram[addr.timer_digit_2]) * 10 + int(ram[addr.timer_digit_3])
     campaign_progress = ((world * 4) + level) * 4096 + level_progress
     return SMBRamMetrics(
+        float_state=float_state,
+        airborne=float_state in (1, 2),
+        x_speed=int(ram[addr.player_x_speed]),
         player_state=int(ram[addr.player_state]),
         player_mode=int(ram[addr.player_mode]),
         player_page=player_page,
         player_x=player_x,
+        player_y_screen=player_y_screen,
         player_x_screen=player_x_screen,
         screen_scroll=int(ram[addr.screen_scroll]),
         camera_x=int(ram[addr.camera_x]),
@@ -163,6 +232,8 @@ def build_metrics_from_ram(ram: np.ndarray, addresses: SMBRamAddresses | None = 
         progress=progress,
         level_progress=level_progress,
         campaign_progress=campaign_progress,
+        enemy_drawn=tuple(int(ram[offset]) for offset in addr.enemy_drawn),
+        enemy_states=tuple(int(ram[offset]) for offset in addr.enemy_states),
     )
 
 
@@ -179,11 +250,148 @@ def is_game_complete(metrics: SMBRamMetrics) -> bool:
     return metrics.game_mode == END_GAME_MODE and (metrics.world, metrics.level) == FINAL_STAGE
 
 
+def progress_window_gain(progress_window: Sequence[int]) -> int:
+    if not progress_window:
+        return 0
+    return int(max(progress_window) - min(progress_window))
+
+
+def jump_window_penalty(
+    *,
+    jump_window_count: int,
+    jump_penalty_threshold: int,
+    jump_penalty_scale: float,
+    jump_action_active: bool,
+    progress_delta: int,
+) -> float:
+    if not jump_action_active or jump_window_count <= jump_penalty_threshold:
+        return 0.0
+
+    excess_jumps = jump_window_count - jump_penalty_threshold
+    penalty = jump_penalty_scale * excess_jumps
+    if progress_delta > 0:
+        penalty *= 0.5
+    return penalty
+
+
+def hop_cluster_penalty(
+    *,
+    jump_window_count: int,
+    progress_window_gain_value: int,
+    hop_cluster_count_threshold: int,
+    hop_cluster_progress_threshold: int,
+    hop_cluster_penalty_scale: float,
+) -> float:
+    if jump_window_count < hop_cluster_count_threshold or progress_window_gain_value >= hop_cluster_progress_threshold:
+        return 0.0
+
+    excess_jumps = jump_window_count - hop_cluster_count_threshold + 1
+    progress_shortfall = hop_cluster_progress_threshold - progress_window_gain_value
+    return hop_cluster_penalty_scale * excess_jumps * (1.0 + progress_shortfall / max(1, hop_cluster_progress_threshold))
+
+
+def defeated_enemy_count(previous: SMBRamMetrics, current: SMBRamMetrics) -> int:
+    defeated_states = {0x09, 0x0B, 0x1F}
+    defeats = 0
+    for prev_drawn, prev_state, curr_state in zip(
+        previous.enemy_drawn, previous.enemy_states, current.enemy_states, strict=True
+    ):
+        if prev_drawn and prev_state not in defeated_states and curr_state in defeated_states:
+            defeats += 1
+    return defeats
+
+
+def behavior_reward_parts(
+    *,
+    current: SMBRamMetrics,
+    reward_config: RewardConfig,
+    progress_delta: int,
+    jump_action_active: bool,
+    jump_started: bool,
+    was_airborne: bool,
+    grounded_run_steps: int,
+    avg_x_speed: float,
+    jump_no_progress_steps: int,
+    is_moving_right: bool,
+    is_running_right: bool,
+    completed_jump_height: int | None,
+    completed_jump_progress: int | None,
+    completed_jump_landing_delta_y: int | None,
+) -> dict[str, float]:
+    reward_parts: dict[str, float] = {}
+
+    grounded_run = is_running_right and not jump_action_active and not current.airborne
+    if grounded_run and avg_x_speed > 12.0:
+        streak_scale = min(1.0 + 0.15 * max(0, grounded_run_steps - 1), 2.5)
+        grounded_run_bonus = streak_scale * (reward_config.run_ground_bonus + max(0.0, avg_x_speed - 16.0) * 0.004)
+        reward_parts["run_ground_bonus"] = grounded_run_bonus
+
+    if jump_started and not was_airborne:
+        speed_deficit = max(0.0, reward_config.min_jump_speed - avg_x_speed)
+        run_deficit = max(0, reward_config.min_run_steps - grounded_run_steps)
+        if speed_deficit > 0 or run_deficit > 0 or not is_running_right:
+            jump_start_penalty = reward_config.jump_start_penalty * (
+                1.0
+                + speed_deficit / max(1.0, reward_config.min_jump_speed)
+                + run_deficit / max(1, reward_config.min_run_steps)
+                + (0.5 if not is_running_right else 0.0)
+            )
+            reward_parts["jump_start_penalty"] = -jump_start_penalty
+
+    if completed_jump_height is not None and completed_jump_height < reward_config.short_jump_height_threshold:
+        short_jump_penalty = reward_config.short_jump_penalty * (
+            1.0 - (completed_jump_height / max(1, reward_config.short_jump_height_threshold))
+        )
+        reward_parts["short_jump_penalty"] = -short_jump_penalty
+
+    if (
+        completed_jump_height is not None
+        and completed_jump_progress is not None
+        and completed_jump_height >= reward_config.good_jump_height_threshold
+        and completed_jump_progress >= reward_config.good_jump_progress_threshold
+    ):
+        reward_parts["good_jump_bonus"] = reward_config.good_jump_bonus
+
+    if (
+        completed_jump_landing_delta_y is not None
+        and completed_jump_progress is not None
+        and completed_jump_landing_delta_y >= reward_config.landing_y_change_threshold
+        and completed_jump_progress >= reward_config.landing_progress_threshold
+    ):
+        reward_parts["landing_spot_bonus"] = reward_config.landing_spot_bonus
+
+    if jump_action_active and progress_delta <= 0:
+        jump_no_progress_penalty = reward_config.jump_no_progress_penalty * (
+            (1 + jump_no_progress_steps) if progress_delta == 0 else (2 + jump_no_progress_steps)
+        )
+        reward_parts["jump_no_progress_penalty"] = -jump_no_progress_penalty
+
+        if avg_x_speed < 16.0 or not is_moving_right:
+            reward_parts["jump_idle_penalty"] = -reward_config.jump_idle_penalty
+
+    return reward_parts
+
+
 def compute_reward_transition(
     previous: SMBRamMetrics,
     current: SMBRamMetrics,
     reward_config: RewardConfig,
     stagnation_steps: int,
+    *,
+    stagnation_window_ready: bool = False,
+    stagnation_window_gain_value: int = 0,
+    jump_window_count: int = 0,
+    jump_action_active: bool = False,
+    jump_started: bool = False,
+    was_airborne: bool = False,
+    grounded_run_steps: int = 0,
+    avg_x_speed: float = 0.0,
+    jump_no_progress_steps: int = 0,
+    is_moving_right: bool = False,
+    is_running_right: bool = False,
+    completed_jump_height: int | None = None,
+    completed_jump_progress: int | None = None,
+    completed_jump_landing_delta_y: int | None = None,
 ) -> RewardTransition:
     reward = 0.0
     reward_parts: dict[str, float] = {}
@@ -202,7 +410,13 @@ def compute_reward_transition(
         reward += total_progress_reward
         reward_parts["progress"] = total_progress_reward
 
-    if is_transition_state(current) or zone_changed or progress_delta != 0:
+    if is_transition_state(current) or zone_changed:
+        next_stagnation_steps = 0
+    elif stagnation_window_ready:
+        next_stagnation_steps = (
+            stagnation_steps + 1 if stagnation_window_gain_value < reward_config.stagnation_min_progress else 0
+        )
+    elif progress_delta != 0:
         next_stagnation_steps = 0
     else:
         next_stagnation_steps = stagnation_steps + 1
@@ -215,6 +429,10 @@ def compute_reward_transition(
         death_penalty = reward_config.death_penalty * death_delta
         reward -= death_penalty
         reward_parts["death_penalty"] = -death_penalty
+        if was_airborne:
+            airborne_penalty = reward_config.airborne_death_penalty * death_delta
+            reward -= airborne_penalty
+            reward_parts["airborne_death_penalty"] = -airborne_penalty
 
     if level_changed:
         reward += reward_config.flag_bonus
@@ -225,6 +443,73 @@ def compute_reward_transition(
         coin_reward = coin_delta * reward_config.coin_bonus
         reward += coin_reward
         reward_parts["coins"] = coin_reward
+
+    player_mode_delta = current.player_mode - previous.player_mode
+    if player_mode_delta > 0:
+        powerup_reward = player_mode_delta * reward_config.powerup_bonus
+        reward += powerup_reward
+        reward_parts["powerup"] = powerup_reward
+
+    reward_parts.update(
+        behavior_reward_parts(
+            current=current,
+            reward_config=reward_config,
+            progress_delta=progress_delta,
+            jump_action_active=jump_action_active,
+            jump_started=jump_started,
+            was_airborne=was_airborne,
+            grounded_run_steps=grounded_run_steps,
+            avg_x_speed=avg_x_speed,
+            jump_no_progress_steps=jump_no_progress_steps,
+            is_moving_right=is_moving_right,
+            is_running_right=is_running_right,
+            completed_jump_height=completed_jump_height,
+            completed_jump_progress=completed_jump_progress,
+            completed_jump_landing_delta_y=completed_jump_landing_delta_y,
+        )
+    )
+    reward += sum(
+        reward_parts[name]
+        for name in reward_parts
+        if name
+        in {
+            "run_ground_bonus",
+            "jump_start_penalty",
+            "short_jump_penalty",
+            "good_jump_bonus",
+            "landing_spot_bonus",
+            "jump_no_progress_penalty",
+            "jump_idle_penalty",
+        }
+    )
+
+    stomp_count = defeated_enemy_count(previous, current)
+    if stomp_count > 0:
+        stomp_bonus = stomp_count * reward_config.stomp_bonus
+        reward += stomp_bonus
+        reward_parts["stomp_bonus"] = stomp_bonus
+
+    excessive_jump_penalty = jump_window_penalty(
+        jump_window_count=jump_window_count,
+        jump_penalty_threshold=reward_config.jump_penalty_threshold,
+        jump_penalty_scale=reward_config.jump_penalty_scale,
+        jump_action_active=jump_action_active,
+        progress_delta=progress_delta,
+    )
+    if excessive_jump_penalty > 0:
+        reward -= excessive_jump_penalty
+        reward_parts["jump_window_penalty"] = -excessive_jump_penalty
+
+    clustered_hop_penalty = hop_cluster_penalty(
+        jump_window_count=jump_window_count,
+        progress_window_gain_value=stagnation_window_gain_value,
+        hop_cluster_count_threshold=reward_config.hop_cluster_count_threshold,
+        hop_cluster_progress_threshold=reward_config.hop_cluster_progress_threshold,
+        hop_cluster_penalty_scale=reward_config.hop_cluster_penalty_scale,
+    )
+    if clustered_hop_penalty > 0:
+        reward -= clustered_hop_penalty
+        reward_parts["hop_cluster_penalty"] = -clustered_hop_penalty
 
     if not zone_changed and next_stagnation_steps >= reward_config.stagnation_steps:
         steps_over = next_stagnation_steps - reward_config.stagnation_steps
@@ -238,6 +523,8 @@ def compute_reward_transition(
         reward_parts=reward_parts,
         stagnation_steps=next_stagnation_steps,
         level_complete=level_changed,
+        jump_window_count=jump_window_count,
+        stagnation_window_gain=stagnation_window_gain_value,
     )
 
 
@@ -282,7 +569,7 @@ def derive_termination_reason(
 def action_tokens(action_name: str) -> tuple[str, ...]:
     if action_name == "noop":
         return ()
-    return tuple(token.lower() for token in action_name.split("_"))
+    return tuple(token for token in (part.lower() for part in action_name.split("_")) if token in BUTTON_TOKENS)
 
 
 class NESMarioBrosEnv(gym.Env):
@@ -298,8 +585,34 @@ class NESMarioBrosEnv(gym.Env):
         grayscale: bool = True,
         max_episode_steps: int = 12000,
         stagnation_steps: int = 240,
+        stagnation_window: int = 48,
+        stagnation_min_progress: int = 24,
         terminate_on_level_complete: bool = False,
         random_noop_max: int = 30,
+        jump_penalty_window: int = 32,
+        jump_penalty_threshold: int = 12,
+        jump_penalty_scale: float = 0.02,
+        jump_no_progress_penalty: float = 0.08,
+        jump_idle_penalty: float = 0.12,
+        jump_start_penalty: float = 0.3,
+        run_ground_bonus: float = 0.04,
+        min_jump_speed: float = 24.0,
+        min_run_steps: int = 6,
+        short_jump_penalty: float = 0.06,
+        short_jump_height_threshold: int = 10,
+        good_jump_bonus: float = 0.12,
+        good_jump_height_threshold: int = 14,
+        good_jump_progress_threshold: int = 12,
+        landing_spot_bonus: float = 0.08,
+        landing_y_change_threshold: int = 6,
+        landing_progress_threshold: int = 12,
+        hop_cluster_penalty_scale: float = 0.16,
+        hop_cluster_count_threshold: int = 4,
+        hop_cluster_progress_threshold: int = 24,
+        stomp_bonus: float = 3.0,
+        enable_long_jumps: bool = True,
+        macro_jump_hold_frames: int = 6,
+        macro_jump_release_frames: int = 1,
         settle_frames: int = 120,
         start_press_frames: int = 10,
         start_wait_frames: int = 180,
@@ -319,30 +632,94 @@ class NESMarioBrosEnv(gym.Env):
         self.settle_frames = settle_frames
         self.start_press_frames = start_press_frames
         self.start_wait_frames = start_wait_frames
-        self.reward_config = RewardConfig(stagnation_steps=stagnation_steps)
+        self.enable_long_jumps = enable_long_jumps
+        self.macro_jump_hold_frames = macro_jump_hold_frames
+        self.macro_jump_release_frames = macro_jump_release_frames
+        self.reward_config = RewardConfig(
+            stagnation_steps=stagnation_steps,
+            stagnation_window=stagnation_window,
+            stagnation_min_progress=stagnation_min_progress,
+            jump_penalty_window=jump_penalty_window,
+            jump_penalty_threshold=jump_penalty_threshold,
+            jump_penalty_scale=jump_penalty_scale,
+            jump_no_progress_penalty=jump_no_progress_penalty,
+            jump_idle_penalty=jump_idle_penalty,
+            jump_start_penalty=jump_start_penalty,
+            run_ground_bonus=run_ground_bonus,
+            min_jump_speed=min_jump_speed,
+            min_run_steps=min_run_steps,
+            short_jump_penalty=short_jump_penalty,
+            short_jump_height_threshold=short_jump_height_threshold,
+            good_jump_bonus=good_jump_bonus,
+            good_jump_height_threshold=good_jump_height_threshold,
+            good_jump_progress_threshold=good_jump_progress_threshold,
+            landing_spot_bonus=landing_spot_bonus,
+            landing_y_change_threshold=landing_y_change_threshold,
+            landing_progress_threshold=landing_progress_threshold,
+            hop_cluster_penalty_scale=hop_cluster_penalty_scale,
+            hop_cluster_count_threshold=hop_cluster_count_threshold,
+            hop_cluster_progress_threshold=hop_cluster_progress_threshold,
+            stomp_bonus=stomp_bonus,
+        )
         self._addresses = SMBRamAddresses()
 
         height, width = resize_shape[1], resize_shape[0]
         channels = 1 if grayscale else 3
         self.observation_space = spaces.Box(low=0, high=255, shape=(height, width, channels), dtype=np.uint8)
-        self.action_space = spaces.Discrete(len(SLIM_ACTIONS))
+        self._action_specs = self._build_action_specs()
+        self.action_space = spaces.Discrete(len(self._action_specs))
 
         self._base_env = None
-        self._agent_env = None
         self._last_frame: np.ndarray | None = None
         self._last_metrics: SMBRamMetrics | None = None
         self._episode_steps = 0
         self._stagnation_steps = 0
         self._furthest_campaign_progress = 0
         self._furthest_level_progress = 0
+        self._progress_window: deque[int] = deque(maxlen=self.reward_config.stagnation_window)
+        self._jump_window: deque[int] = deque(maxlen=self.reward_config.jump_penalty_window)
+        self._speed_window: deque[int] = deque(maxlen=8)
+        self._prev_jump_action_active = False
+        self._ground_run_steps = 0
+        self._jump_no_progress_steps = 0
+        self._jump_start_y: int | None = None
+        self._jump_peak_y: int | None = None
+        self._jump_start_progress: int | None = None
+        self._last_completed_jump_height = 0
+        self._last_completed_jump_progress = 0
+        self._last_completed_jump_landing_delta_y = 0
 
         self._load_backend()
         self._boot_to_level_start()
 
+    def _build_action_specs(self) -> tuple[ActionSpec, ...]:
+        specs = [self._make_action_spec(name, buttons, mask) for name, buttons, mask in SLIM_ACTIONS]
+        if self.enable_long_jumps:
+            specs.extend(
+                self._make_action_spec(name, buttons, mask, long_jump=True) for name, buttons, mask in LONG_JUMP_ACTIONS
+            )
+        return tuple(specs)
+
+    def _make_action_spec(
+        self,
+        name: str,
+        buttons: tuple[str, ...],
+        mask: int,
+        *,
+        long_jump: bool = False,
+    ) -> ActionSpec:
+        if long_jump and (mask & BUTTON_A):
+            hold_frames = max(self.frames_per_action, self.macro_jump_hold_frames)
+            release_frames = max(self.macro_jump_release_frames, 0)
+            release_mask = mask & ~BUTTON_A
+            sequence = (mask,) * hold_frames + (release_mask,) * release_frames
+        else:
+            sequence = (mask,) * max(self.frames_per_action, 1)
+        return ActionSpec(name=name, buttons=buttons, sequence=sequence)
+
     def _load_backend(self) -> None:
         try:
             from nes_py import NESEnv
-            from nes_py.wrappers import JoypadSpace
         except ImportError as exc:
             raise ImportError(
                 "NES-SMB-v0 requires nes-py in the active environment. "
@@ -350,8 +727,6 @@ class NESMarioBrosEnv(gym.Env):
             ) from exc
 
         self._base_env = NESEnv(str(self.rom_path))
-        action_layouts = [list(buttons) for _name, buttons, _mask in SLIM_ACTIONS]
-        self._agent_env = JoypadSpace(self._base_env, action_layouts)
 
     def _boot_to_level_start(self) -> None:
         assert self._base_env is not None
@@ -388,6 +763,11 @@ class NESMarioBrosEnv(gym.Env):
         action_name: str,
         reward_parts: dict[str, float],
         termination_reason: str | None,
+        jump_window_count: int = 0,
+        stagnation_window_gain_value: int = 0,
+        avg_x_speed: float = 0.0,
+        current_jump_height: int = 0,
+        current_jump_progress: int = 0,
     ) -> dict[str, Any]:
         info = metrics.to_info()
         info.update(
@@ -398,7 +778,17 @@ class NESMarioBrosEnv(gym.Env):
                 "furthest_progress": self._furthest_campaign_progress,
                 "furthest_level_progress": self._furthest_level_progress,
                 "stagnation_steps": self._stagnation_steps,
+                "stagnation_window_gain": stagnation_window_gain_value,
                 "termination_reason": termination_reason,
+                "jump_window_count": jump_window_count,
+                "ground_run_steps": self._ground_run_steps,
+                "jump_no_progress_steps": self._jump_no_progress_steps,
+                "avg_x_speed": avg_x_speed,
+                "current_jump_height": current_jump_height,
+                "current_jump_progress": current_jump_progress,
+                "last_completed_jump_height": self._last_completed_jump_height,
+                "last_completed_jump_progress": self._last_completed_jump_progress,
+                "last_completed_jump_landing_delta_y": self._last_completed_jump_landing_delta_y,
                 "reward_parts": reward_parts,
                 "render_mode": self.render_mode,
             }
@@ -407,7 +797,7 @@ class NESMarioBrosEnv(gym.Env):
 
     @property
     def action_names(self) -> tuple[str, ...]:
-        return tuple(name for name, _buttons, _mask in SLIM_ACTIONS)
+        return tuple(spec.name for spec in self._action_specs)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
@@ -426,6 +816,20 @@ class NESMarioBrosEnv(gym.Env):
         self._last_metrics = metrics
         self._furthest_campaign_progress = metrics.campaign_progress
         self._furthest_level_progress = metrics.level_progress
+        self._progress_window.clear()
+        self._progress_window.append(metrics.level_progress)
+        self._jump_window.clear()
+        self._speed_window.clear()
+        self._speed_window.append(metrics.x_speed)
+        self._prev_jump_action_active = False
+        self._ground_run_steps = 0
+        self._jump_no_progress_steps = 0
+        self._jump_start_y = None
+        self._jump_peak_y = None
+        self._jump_start_progress = None
+        self._last_completed_jump_height = 0
+        self._last_completed_jump_progress = 0
+        self._last_completed_jump_landing_delta_y = 0
         self._last_frame = np.array(frame, copy=True)
 
         self._render_human_if_needed()
@@ -434,29 +838,108 @@ class NESMarioBrosEnv(gym.Env):
             action_name="noop",
             reward_parts={},
             termination_reason=None,
+            jump_window_count=0,
+            stagnation_window_gain_value=0,
+            avg_x_speed=float(metrics.x_speed),
+            current_jump_height=0,
+            current_jump_progress=0,
         )
 
     def step(self, action: int):
-        assert self._agent_env is not None
         assert self._last_metrics is not None
+        assert self._base_env is not None
 
-        action_name, _buttons, _mask = SLIM_ACTIONS[int(action)]
+        action_spec = self._action_specs[int(action)]
+        jump_action_active = action_spec.uses_jump
+        jump_started = jump_action_active and not self._prev_jump_action_active
+        action_name = action_spec.name
+        action_name_tokens = set(action_tokens(action_name))
         frame: np.ndarray | None = None
-        for _ in range(self.frames_per_action):
-            frame, _base_reward, _base_terminated, _base_truncated, _base_info = self._agent_env.step(int(action))
+        for action_mask in action_spec.sequence:
+            frame, _base_reward, _base_terminated, _base_truncated, _base_info = self._base_env.step(action_mask)
 
         assert frame is not None
         self._episode_steps += 1
         current_metrics = self._metrics()
+        zone_changed = (current_metrics.world, current_metrics.level, current_metrics.area_offset) != (
+            self._last_metrics.world,
+            self._last_metrics.level,
+            self._last_metrics.area_offset,
+        )
+        if zone_changed or is_transition_state(current_metrics):
+            self._progress_window.clear()
+        self._progress_window.append(current_metrics.level_progress)
+        self._jump_window.append(1 if jump_started else 0)
+        self._speed_window.append(current_metrics.x_speed)
+        stagnation_window_gain_value = progress_window_gain(self._progress_window)
+        stagnation_window_ready = len(self._progress_window) == self._progress_window.maxlen
+        jump_window_count = sum(self._jump_window)
+        avg_x_speed = sum(self._speed_window) / max(1, len(self._speed_window))
+        progress_delta = current_metrics.progress - self._last_metrics.progress
+        if jump_action_active and progress_delta <= 0:
+            next_jump_no_progress_steps = self._jump_no_progress_steps + 1
+        else:
+            next_jump_no_progress_steps = 0
+        grounded_run_steps = self._ground_run_steps
+        is_moving_right = "right" in action_name_tokens
+        is_running_right = is_moving_right and "b" in action_name_tokens
+        completed_jump_height: int | None = None
+        completed_jump_progress: int | None = None
+        completed_jump_landing_delta_y: int | None = None
+        current_jump_height = 0
+        current_jump_progress = 0
+        if jump_started and not self._last_metrics.airborne:
+            self._jump_start_y = self._last_metrics.player_y_screen
+            self._jump_peak_y = min(self._last_metrics.player_y_screen, current_metrics.player_y_screen)
+            self._jump_start_progress = self._last_metrics.progress
+        elif self._jump_start_y is not None and self._jump_peak_y is not None:
+            self._jump_peak_y = min(self._jump_peak_y, current_metrics.player_y_screen)
+
+        if self._jump_start_y is not None and self._jump_peak_y is not None and self._jump_start_progress is not None:
+            current_jump_height = max(0, self._jump_start_y - self._jump_peak_y)
+            current_jump_progress = max(0, current_metrics.progress - self._jump_start_progress)
+            if not current_metrics.airborne and (self._last_metrics.airborne or jump_started):
+                completed_jump_height = current_jump_height
+                completed_jump_progress = current_jump_progress
+                completed_jump_landing_delta_y = abs(current_metrics.player_y_screen - self._jump_start_y)
+                self._last_completed_jump_height = completed_jump_height
+                self._last_completed_jump_progress = completed_jump_progress
+                self._last_completed_jump_landing_delta_y = completed_jump_landing_delta_y
+                self._jump_start_y = None
+                self._jump_peak_y = None
+                self._jump_start_progress = None
         transition = compute_reward_transition(
             self._last_metrics,
             current_metrics,
             self.reward_config,
             self._stagnation_steps,
+            stagnation_window_ready=stagnation_window_ready,
+            stagnation_window_gain_value=stagnation_window_gain_value,
+            jump_window_count=jump_window_count,
+            jump_action_active=jump_action_active,
+            jump_started=jump_started,
+            was_airborne=self._last_metrics.airborne,
+            grounded_run_steps=grounded_run_steps,
+            avg_x_speed=avg_x_speed,
+            jump_no_progress_steps=next_jump_no_progress_steps,
+            is_moving_right=is_moving_right,
+            is_running_right=is_running_right,
+            completed_jump_height=completed_jump_height,
+            completed_jump_progress=completed_jump_progress,
+            completed_jump_landing_delta_y=completed_jump_landing_delta_y,
         )
         self._stagnation_steps = transition.stagnation_steps
         self._furthest_campaign_progress = max(self._furthest_campaign_progress, current_metrics.campaign_progress)
         self._furthest_level_progress = max(self._furthest_level_progress, current_metrics.level_progress)
+        grounded_run = is_running_right and not jump_action_active and not current_metrics.airborne
+        if grounded_run:
+            self._ground_run_steps = min(self._ground_run_steps + 1, 60)
+        elif not current_metrics.airborne:
+            self._ground_run_steps = 0
+        if jump_started and not self._last_metrics.airborne:
+            self._ground_run_steps = 0
+        self._jump_no_progress_steps = next_jump_no_progress_steps
+        self._prev_jump_action_active = jump_action_active
         terminated, truncated, termination_reason = derive_termination_reason(
             current_metrics,
             self.reward_config,
@@ -477,9 +960,14 @@ class NESMarioBrosEnv(gym.Env):
             truncated,
             self._build_info(
                 current_metrics,
-                action_name=action_name,
+                action_name=action_spec.name,
                 reward_parts=transition.reward_parts,
                 termination_reason=termination_reason,
+                jump_window_count=transition.jump_window_count,
+                stagnation_window_gain_value=transition.stagnation_window_gain,
+                avg_x_speed=avg_x_speed,
+                current_jump_height=current_jump_height,
+                current_jump_progress=current_jump_progress,
             ),
         )
 
@@ -495,6 +983,5 @@ class NESMarioBrosEnv(gym.Env):
         if self._base_env is not None:
             self._base_env.close()
             self._base_env = None
-        self._agent_env = None
         self._last_frame = None
         self._last_metrics = None
