@@ -67,6 +67,24 @@ Common local tasks:
 - `mise run lint` runs the Ruff checks
 - `mise run type` runs mypy
 - `mise run build` builds source and wheel distributions
+- `mise run train-nes-watch` runs the local visible `nes-py` SMB PPO trainer on `mps`
+
+### Local `nes-py` SMB training
+
+This fork includes a local `NES-SMB-v0` environment backed by the sibling `nes-py` checkout.
+The default visible training task uses the bundled known-good SMB reference ROM from the sibling `nes-py` repo:
+
+```bash
+mise run train-nes-watch
+```
+
+There is also a sibling-ROM variant:
+
+```bash
+mise run train-nes-watch-sibling-rom
+```
+
+At the moment, `/Users/justinedwards/git/NES-SMB-RL/rom/Super Mario Bros.nes` is not accepted by `nes-py` on this machine, so the default watch task intentionally points at the bundled reference ROM instead.
 
 ### Full installation (with extra envs and test dependencies)
 

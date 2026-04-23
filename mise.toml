@@ -8,11 +8,11 @@ python.uv_venv_auto = "create|source"
 [tasks.setup]
 description = "Install the project, extras, and contributor dependencies with uv"
 alias = ["bootstrap", "install"]
-run = "git submodule update --init --recursive && uv sync --group dev && uv pip install -e '.[plots,tests]'"
+run = "git submodule update --init --recursive && uv sync --group dev && uv pip install -e /Users/justinedwards/git/NES-SMB-RL/nes-py && uv pip install -e '.[plots,tests]'"
 
 [tasks.setup-full]
 description = "Install contributor dependencies plus optional extra environment packages"
-run = "git submodule update --init --recursive && uv sync --group dev --group extra-envs && uv pip install -e '.[plots,tests]'"
+run = "git submodule update --init --recursive && uv sync --group dev --group extra-envs && uv pip install -e /Users/justinedwards/git/NES-SMB-RL/nes-py && uv pip install -e '.[plots,tests]'"
 
 [tasks.test]
 description = "Run the default pytest suite"
@@ -55,3 +55,11 @@ find . -name "*.pyc" -delete
 [tasks.ci]
 description = "Run the default local verification steps"
 depends = ["test", "lint", "type", "build"]
+
+[tasks.train-nes-watch]
+description = "Run a visible single-env PPO training session for the local nes-py SMB integration"
+run = "uv run python train.py --algo ppo --env NES-SMB-v0 --device mps --vec-env dummy --conf-file hyperparams/python/ppo_nes_smb.py --log-folder logs/nes-smb-watch --eval-freq 10000 --eval-episodes 3 --n-eval-envs 1 --save-freq 25000 --env-kwargs rom_path:\"'/Users/justinedwards/git/NES-SMB-RL/nes-py/nes_py/tests/games/super-mario-bros-1.nes'\" frames_per_action:2 max_episode_steps:12000 stagnation_steps:240 random_noop_max:30 render_mode:\"'human'\" --eval-env-kwargs rom_path:\"'/Users/justinedwards/git/NES-SMB-RL/nes-py/nes_py/tests/games/super-mario-bros-1.nes'\" frames_per_action:2 max_episode_steps:12000 stagnation_steps:240 random_noop_max:0 render_mode:\"'rgb_array'\""
+
+[tasks.train-nes-watch-sibling-rom]
+description = "Run the visible trainer against the sibling ROM path if that ROM is compatible with nes-py"
+run = "uv run python train.py --algo ppo --env NES-SMB-v0 --device mps --vec-env dummy --conf-file hyperparams/python/ppo_nes_smb.py --log-folder logs/nes-smb-watch --eval-freq 10000 --eval-episodes 3 --n-eval-envs 1 --save-freq 25000 --env-kwargs rom_path:\"'/Users/justinedwards/git/NES-SMB-RL/rom/Super Mario Bros.nes'\" frames_per_action:2 max_episode_steps:12000 stagnation_steps:240 random_noop_max:30 render_mode:\"'human'\" --eval-env-kwargs rom_path:\"'/Users/justinedwards/git/NES-SMB-RL/rom/Super Mario Bros.nes'\" frames_per_action:2 max_episode_steps:12000 stagnation_steps:240 random_noop_max:0 render_mode:\"'rgb_array'\""

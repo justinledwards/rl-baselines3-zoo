@@ -54,6 +54,12 @@ try:
 except ImportError:
     pass
 
+if "NES-SMB-v0" not in gym.envs.registry:
+    register(
+        id="NES-SMB-v0",
+        entry_point="rl_zoo3.nes_smb_env:NESMarioBrosEnv",
+    )
+
 
 # Register no vel envs
 def create_no_vel_env(env_id: str) -> Callable[[str | None], gym.Env]:

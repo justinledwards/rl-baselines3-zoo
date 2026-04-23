@@ -1,6 +1,7 @@
 import os
 import tempfile
 import time
+from collections import Counter
 from copy import deepcopy
 from functools import wraps
 from threading import Thread
@@ -235,3 +236,106 @@ class RawStatisticsCallback(BaseCallback):
                 self._tensorboard_writer.write(logger_dict, exclude_dict, self._timesteps_counter)
 
         return True
+
+
+class NESSMBTrainingStatsCallback(BaseCallback):
+    """
+    Callback for compact SMB progress logging in the zoo trainer.
+    """
+
+    def __init__(self, verbose: int = 1):
+        super().__init__(verbose)
+        self._rollout_action_counts: Counter[str] = Counter()
+        self._rollout_button_counts: Counter[str] = Counter()
+        self._episode_rewards: list[float] = []
+        self._episode_lengths: list[int] = []
+        self._max_world = 0
+        self._max_level = 0
+        self._max_level_x = 0
+        self._max_campaign_progress = 0
+        self._latest_world = 0
+        self._latest_level = 0
+        self._latest_level_x = 0
+        self._latest_furthest_x = 0
+        self._last_termination_reason: str | None = None
+
+    @staticmethod
+    def _button_tokens(action_name: str) -> tuple[str, ...]:
+        if not action_name or action_name == "noop":
+            return ()
+        return tuple(token.lower() for token in action_name.split("_"))
+
+    def _on_step(self) -> bool:
+        for info in self.locals["infos"]:
+            action_name = info.get("action_name")
+            if action_name:
+                self._rollout_action_counts[action_name] += 1
+                for token in self._button_tokens(action_name):
+                    self._rollout_button_counts[token] += 1
+
+            world_display = int(info.get("world_display", 0) or 0)
+            level_display = int(info.get("level_display", 0) or 0)
+            level_progress = int(info.get("level_progress", 0) or 0)
+            furthest_level_progress = int(info.get("furthest_level_progress", 0) or 0)
+            campaign_progress = int(info.get("furthest_progress", 0) or 0)
+
+            self._latest_world = world_display or self._latest_world
+            self._latest_level = level_display or self._latest_level
+            self._latest_level_x = level_progress
+            self._latest_furthest_x = furthest_level_progress
+
+            self._max_world = max(self._max_world, world_display)
+            self._max_level = max(self._max_level, level_display)
+            self._max_level_x = max(self._max_level_x, level_progress, furthest_level_progress)
+            self._max_campaign_progress = max(self._max_campaign_progress, campaign_progress)
+
+            if "episode" in info:
+                self._episode_rewards.append(float(info["episode"]["r"]))
+                self._episode_lengths.append(int(info["episode"]["l"]))
+
+            termination_reason = info.get("termination_reason")
+            if termination_reason:
+                self._last_termination_reason = str(termination_reason)
+
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if self._rollout_action_counts:
+            for action_name, count in sorted(self._rollout_action_counts.items()):
+                self.logger.record(f"actions/{action_name}", count)
+
+        if self._rollout_button_counts:
+            for button_name, count in sorted(self._rollout_button_counts.items()):
+                self.logger.record(f"buttons/{button_name}", count)
+
+        self.logger.record("progress/max_world", self._max_world)
+        self.logger.record("progress/max_level", self._max_level)
+        self.logger.record("progress/max_level_x", self._max_level_x)
+        self.logger.record("progress/max_campaign_progress", self._max_campaign_progress)
+
+        if self._episode_rewards:
+            self.logger.record("rollout/ep_rew_mean", sum(self._episode_rewards) / len(self._episode_rewards))
+            self.logger.record("rollout/ep_len_mean", sum(self._episode_lengths) / len(self._episode_lengths))
+
+        if self.verbose > 0:
+            action_summary = " ".join(
+                f"{name}:{count}"
+                for name, count in sorted(self._rollout_action_counts.items(), key=lambda item: (-item[1], item[0]))
+            )
+            button_summary = " ".join(
+                f"{name}:{count}"
+                for name, count in sorted(self._rollout_button_counts.items(), key=lambda item: (-item[1], item[0]))
+            )
+            location = f"W{self._latest_world or 1}-{self._latest_level or 1}"
+            reason = f" reason={self._last_termination_reason}" if self._last_termination_reason else ""
+            print(
+                f"[NES-SMB] {location} x={self._latest_level_x} furthest_x={self._latest_furthest_x} "
+                f"best_campaign={self._max_campaign_progress}{reason} "
+                f"buttons[{button_summary or 'none'}] actions[{action_summary or 'none'}]"
+            )
+
+        self._rollout_action_counts.clear()
+        self._rollout_button_counts.clear()
+        self._episode_rewards.clear()
+        self._episode_lengths.clear()
+        self._last_termination_reason = None
