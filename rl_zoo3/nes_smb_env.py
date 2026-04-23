@@ -280,6 +280,16 @@ def progress_window_gain(progress_window: Sequence[int]) -> int:
     return int(max(progress_window) - min(progress_window))
 
 
+def movement_trace_payload(trace_window: Sequence[dict[str, int | bool]]) -> dict[str, list[int]]:
+    samples = list(trace_window)
+    return {
+        "speed_trace": [int(sample["x_speed"]) for sample in samples],
+        "progress_trace": [int(sample["progress"]) for sample in samples],
+        "screen_x_trace": [int(sample["screen_x"]) for sample in samples],
+        "airborne_trace": [1 if bool(sample["airborne"]) else 0 for sample in samples],
+    }
+
+
 def jump_window_penalty(
     *,
     jump_window_count: int,
@@ -818,6 +828,7 @@ class NESMarioBrosEnv(gym.Env):
         self._progress_window: deque[int] = deque(maxlen=self.reward_config.stagnation_window)
         self._jump_window: deque[int] = deque(maxlen=self.reward_config.jump_penalty_window)
         self._speed_window: deque[int] = deque(maxlen=8)
+        self._movement_trace: deque[dict[str, int | bool]] = deque(maxlen=8)
         self._prev_jump_action_active = False
         self._ground_run_steps = 0
         self._jump_no_progress_steps = 0
@@ -959,12 +970,24 @@ class NESMarioBrosEnv(gym.Env):
         }
         self._event_log.append(event)
 
+    @staticmethod
+    def _trace_sample(metrics: SMBRamMetrics) -> dict[str, int | bool]:
+        return {
+            "progress": metrics.progress,
+            "screen_x": metrics.player_x_screen,
+            "x_speed": metrics.x_speed,
+            "airborne": metrics.airborne,
+        }
+
     def _maybe_record_behavior_events(
         self,
         metrics: SMBRamMetrics,
         *,
         nearest_enemy: dict[str, int | str] | None,
         pipe_stall_detected: bool,
+        stagnation_steps: int,
+        stagnation_window_gain_value: int,
+        furthest_level_progress: int,
         termination_reason: str | None,
     ) -> None:
         if nearest_enemy is not None and "first_enemy_seen" not in self._seen_event_keys:
@@ -990,8 +1013,20 @@ class NESMarioBrosEnv(gym.Env):
                 self._seen_event_keys.add(event_key)
 
         if pipe_stall_detected and "pipe_stall" not in self._seen_event_keys:
-            self._append_event("pipe_stall", metrics, x_speed=metrics.x_speed)
+            self._append_event("pipe_stall", metrics, x_speed=metrics.x_speed, **movement_trace_payload(self._movement_trace))
             self._seen_event_keys.add("pipe_stall")
+
+        if stagnation_steps > 0 and "stagnation_detected" not in self._seen_event_keys:
+            self._append_event(
+                "stagnation_detected",
+                metrics,
+                x_speed=metrics.x_speed,
+                stagnation_steps=stagnation_steps,
+                stagnation_window_gain=stagnation_window_gain_value,
+                furthest_gap=max(0, furthest_level_progress - metrics.level_progress),
+                **movement_trace_payload(self._movement_trace),
+            )
+            self._seen_event_keys.add("stagnation_detected")
 
         if termination_reason == "death" and nearest_enemy is not None:
             self._append_event(
@@ -1001,7 +1036,12 @@ class NESMarioBrosEnv(gym.Env):
                 enemy_dx=nearest_enemy["dx"],
             )
         elif termination_reason == "stagnation" and pipe_stall_detected:
-            self._append_event("stagnation_at_pipe", metrics, x_speed=metrics.x_speed)
+            self._append_event(
+                "stagnation_at_pipe",
+                metrics,
+                x_speed=metrics.x_speed,
+                **movement_trace_payload(self._movement_trace),
+            )
 
     @property
     def action_names(self) -> tuple[str, ...]:
@@ -1029,6 +1069,8 @@ class NESMarioBrosEnv(gym.Env):
         self._jump_window.clear()
         self._speed_window.clear()
         self._speed_window.append(metrics.x_speed)
+        self._movement_trace.clear()
+        self._movement_trace.append(self._trace_sample(metrics))
         self._prev_jump_action_active = False
         self._ground_run_steps = 0
         self._jump_no_progress_steps = 0
@@ -1084,6 +1126,7 @@ class NESMarioBrosEnv(gym.Env):
         self._progress_window.append(current_metrics.level_progress)
         self._jump_window.append(1 if jump_started else 0)
         self._speed_window.append(current_metrics.x_speed)
+        self._movement_trace.append(self._trace_sample(current_metrics))
         stagnation_window_gain_value = progress_window_gain(self._progress_window)
         stagnation_window_ready = len(self._progress_window) == self._progress_window.maxlen
         jump_window_count = sum(self._jump_window)
@@ -1171,6 +1214,9 @@ class NESMarioBrosEnv(gym.Env):
             current_metrics,
             nearest_enemy=nearest_enemy,
             pipe_stall_detected=pipe_stall_detected,
+            stagnation_steps=transition.stagnation_steps,
+            stagnation_window_gain_value=transition.stagnation_window_gain,
+            furthest_level_progress=self._furthest_level_progress,
             termination_reason=termination_reason,
         )
 

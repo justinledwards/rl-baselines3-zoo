@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +8,7 @@ import pytest
 
 from rl_zoo3.nes_smb_env import (
     RewardConfig,
+    NESMarioBrosEnv,
     action_tokens,
     build_metrics_from_ram,
     compute_reward_transition,
@@ -15,6 +17,7 @@ from rl_zoo3.nes_smb_env import (
     hop_cluster_penalty,
     is_pipe_stall,
     jump_window_penalty,
+    movement_trace_payload,
     nearest_enemy_ahead,
     progress_window_gain,
 )
@@ -50,6 +53,63 @@ def test_build_metrics_from_ram():
     assert metrics.level_display == 1
     assert metrics.timer == 397
     assert metrics.campaign_progress == 288
+
+
+def test_movement_trace_payload():
+    payload = movement_trace_payload(
+        [
+            {"progress": 600, "screen_x": 112, "x_speed": 48, "airborne": False},
+            {"progress": 606, "screen_x": 112, "x_speed": 12, "airborne": False},
+            {"progress": 606, "screen_x": 112, "x_speed": 0, "airborne": False},
+        ]
+    )
+
+    assert payload["speed_trace"] == [48, 12, 0]
+    assert payload["progress_trace"] == [600, 606, 606]
+    assert payload["screen_x_trace"] == [112, 112, 112]
+    assert payload["airborne_trace"] == [0, 0, 0]
+
+
+def test_stagnation_event_includes_trace_fields():
+    ram = _make_ram()
+    ram[0x006D] = 0
+    ram[0x0086] = 120
+    ram[0x00CE] = 191
+    ram[0x0755] = 112
+    ram[0x0770] = 1
+    metrics = build_metrics_from_ram(ram)
+
+    env = NESMarioBrosEnv.__new__(NESMarioBrosEnv)
+    env.reward_config = RewardConfig()
+    env._event_log = deque(maxlen=32)
+    env._event_seq = 0
+    env._seen_event_keys = set()
+    env._episode_steps = 77
+    env._movement_trace = deque(
+        [
+            {"progress": 600, "screen_x": 112, "x_speed": 48, "airborne": False},
+            {"progress": 606, "screen_x": 112, "x_speed": 12, "airborne": False},
+            {"progress": 606, "screen_x": 112, "x_speed": 3, "airborne": False},
+        ],
+        maxlen=8,
+    )
+
+    env._maybe_record_behavior_events(
+        metrics,
+        nearest_enemy=None,
+        pipe_stall_detected=False,
+        stagnation_steps=3,
+        stagnation_window_gain_value=6,
+        furthest_level_progress=180,
+        termination_reason=None,
+    )
+
+    event = env._event_log[-1]
+    assert event["type"] == "stagnation_detected"
+    assert event["stagnation_steps"] == 3
+    assert event["stagnation_window_gain"] == 6
+    assert event["furthest_gap"] == 60
+    assert event["speed_trace"] == [48, 12, 3]
 
 
 def test_compute_reward_transition_progress_and_coin():

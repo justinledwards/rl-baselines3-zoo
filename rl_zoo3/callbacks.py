@@ -271,6 +271,31 @@ class NESSMBTrainingStatsCallback(BaseCallback):
             if token in allowed_tokens
         )
 
+    @staticmethod
+    def _event_location(last_event: dict[str, object]) -> str:
+        return f"W{int(last_event.get('world_display', 1) or 1)}-{int(last_event.get('level_display', 1) or 1)}"
+
+    @staticmethod
+    def _event_detail(last_event: dict[str, object]) -> str:
+        detail = ""
+        if "enemy_label" in last_event:
+            detail += f" enemy={last_event['enemy_label']}"
+        if "enemy_dx" in last_event:
+            detail += f" dx={last_event['enemy_dx']}"
+        if "x_speed" in last_event:
+            detail += f" x_speed={last_event['x_speed']}"
+        if "stagnation_steps" in last_event:
+            detail += f" stagnation_steps={last_event['stagnation_steps']}"
+        if "stagnation_window_gain" in last_event:
+            detail += f" gain={last_event['stagnation_window_gain']}"
+        if "furthest_gap" in last_event:
+            detail += f" furthest_gap={last_event['furthest_gap']}"
+        if "speed_trace" in last_event:
+            detail += f" speed_trace={last_event['speed_trace']}"
+        if "progress_trace" in last_event:
+            detail += f" progress_trace={last_event['progress_trace']}"
+        return detail
+
     def _on_step(self) -> bool:
         for info in self.locals["infos"]:
             action_name = info.get("action_name")
@@ -309,17 +334,8 @@ class NESSMBTrainingStatsCallback(BaseCallback):
                 if event_id > self._last_event_id:
                     self._last_event_id = event_id
                     if self.verbose > 0:
-                        location = (
-                            f"W{int(last_event.get('world_display', 1) or 1)}-"
-                            f"{int(last_event.get('level_display', 1) or 1)}"
-                        )
-                        detail = ""
-                        if "enemy_label" in last_event:
-                            detail += f" enemy={last_event['enemy_label']}"
-                        if "enemy_dx" in last_event:
-                            detail += f" dx={last_event['enemy_dx']}"
-                        if "x_speed" in last_event:
-                            detail += f" x_speed={last_event['x_speed']}"
+                        location = self._event_location(last_event)
+                        detail = self._event_detail(last_event)
                         print(
                             f"[NES-SMB event] {location} type={last_event.get('type')} "
                             f"step={last_event.get('episode_steps')} x={last_event.get('level_progress')}{detail}"
