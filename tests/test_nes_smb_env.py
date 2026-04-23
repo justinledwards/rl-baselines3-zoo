@@ -13,7 +13,9 @@ from rl_zoo3.nes_smb_env import (
     defeated_enemy_count,
     derive_termination_reason,
     hop_cluster_penalty,
+    is_pipe_stall,
     jump_window_penalty,
+    nearest_enemy_ahead,
     progress_window_gain,
 )
 
@@ -367,6 +369,95 @@ def test_compute_reward_transition_rewards_stomp_bonus():
     transition = compute_reward_transition(previous, current, RewardConfig(stomp_bonus=3.0), stagnation_steps=0)
 
     assert transition.reward_parts["stomp_bonus"] == pytest.approx(3.0)
+
+
+def test_nearest_enemy_ahead_detects_first_enemy():
+    ram = _make_ram()
+    ram[0x0086] = 80
+    ram[0x0755] = 80
+    ram[0x0770] = 1
+    ram[0x000E] = 8
+    ram[0x000F] = 1
+    ram[0x0016] = 0x06
+    ram[0x001E] = 0x06
+    ram[0x006E] = 0
+    ram[0x0087] = 104
+    ram[0x00B6] = 1
+    ram[0x00CF] = 191
+
+    metrics = build_metrics_from_ram(ram)
+    nearest = nearest_enemy_ahead(metrics)
+
+    assert nearest is not None
+    assert nearest["label"] == "goomba"
+    assert nearest["dx"] == 24
+
+
+def test_is_pipe_stall_detects_low_speed_wallup():
+    ram = _make_ram()
+    ram[0x0086] = 120
+    ram[0x0755] = 112
+    ram[0x0057] = 3
+    ram[0x0770] = 1
+    ram[0x000E] = 8
+
+    metrics = build_metrics_from_ram(ram)
+
+    assert is_pipe_stall(metrics, 8, RewardConfig(pipe_stall_screen_x_threshold=100, pipe_stall_speed_threshold=5))
+
+
+def test_compute_reward_transition_penalizes_ignoring_critical_enemy():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 100
+    ram_prev[0x0755] = 100
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+
+    ram_curr[:] = ram_prev
+    ram_curr[0x0086] = 102
+    ram_curr[0x0755] = 102
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+    transition = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(enemy_ignore_penalty=0.16, enemy_immediate_dx_threshold=18),
+        stagnation_steps=0,
+        nearest_enemy_dx=12,
+        jump_action_active=False,
+    )
+
+    assert transition.reward_parts["enemy_ignore_penalty"] == pytest.approx(-0.16)
+
+
+def test_compute_reward_transition_penalizes_pipe_stall_choice():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 120
+    ram_prev[0x0755] = 112
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+
+    ram_curr[:] = ram_prev
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+    transition = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(pipe_stall_choice_penalty=0.2),
+        stagnation_steps=0,
+        pipe_stall_detected=True,
+        jump_action_active=False,
+    )
+
+    assert transition.reward_parts["pipe_stall_choice_penalty"] == pytest.approx(-0.2)
 
 
 def test_progress_window_gain_and_jump_window_penalty():

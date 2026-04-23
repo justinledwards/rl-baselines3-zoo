@@ -73,7 +73,12 @@ class SMBRamAddresses:
     player_state: int = 0x000E
     player_mode: int = 0x000F
     enemy_drawn: tuple[int, ...] = (0x000F, 0x0010, 0x0011, 0x0012, 0x0013)
+    enemy_types: tuple[int, ...] = (0x0016, 0x0017, 0x0018, 0x0019, 0x001A)
     enemy_states: tuple[int, ...] = (0x001E, 0x001F, 0x0020, 0x0021, 0x0022)
+    enemy_pages: tuple[int, ...] = (0x006E, 0x006F, 0x0070, 0x0071, 0x0072)
+    enemy_x_screens: tuple[int, ...] = (0x0087, 0x0088, 0x0089, 0x008A, 0x008B)
+    enemy_y_viewports: tuple[int, ...] = (0x00B6, 0x00B7, 0x00B8, 0x00B9, 0x00BA)
+    enemy_y_screens: tuple[int, ...] = (0x00CF, 0x00D0, 0x00D1, 0x00D2, 0x00D3)
     lives: int = 0x075A
     screen_scroll: int = 0x071C
     camera_x: int = 0x073F
@@ -126,6 +131,12 @@ class RewardConfig:
     hop_cluster_count_threshold: int = 4
     hop_cluster_progress_threshold: int = 24
     stomp_bonus: float = 3.0
+    enemy_ignore_penalty: float = 0.16
+    enemy_immediate_dx_threshold: int = 18
+    pipe_stall_choice_penalty: float = 0.2
+    pipe_stall_screen_x_threshold: int = 100
+    pipe_stall_speed_threshold: int = 5
+    pipe_stall_progress_threshold: int = 12
 
 
 @dataclass(frozen=True)
@@ -152,7 +163,12 @@ class SMBRamMetrics:
     level_progress: int
     campaign_progress: int
     enemy_drawn: tuple[int, ...]
+    enemy_types: tuple[int, ...]
     enemy_states: tuple[int, ...]
+    enemy_pages: tuple[int, ...]
+    enemy_x_screens: tuple[int, ...]
+    enemy_y_viewports: tuple[int, ...]
+    enemy_y_screens: tuple[int, ...]
 
     @property
     def world_display(self) -> int:
@@ -236,7 +252,12 @@ def build_metrics_from_ram(ram: np.ndarray, addresses: SMBRamAddresses | None = 
         level_progress=level_progress,
         campaign_progress=campaign_progress,
         enemy_drawn=tuple(int(ram[offset]) for offset in addr.enemy_drawn),
+        enemy_types=tuple(int(ram[offset]) for offset in addr.enemy_types),
         enemy_states=tuple(int(ram[offset]) for offset in addr.enemy_states),
+        enemy_pages=tuple(int(ram[offset]) for offset in addr.enemy_pages),
+        enemy_x_screens=tuple(int(ram[offset]) for offset in addr.enemy_x_screens),
+        enemy_y_viewports=tuple(int(ram[offset]) for offset in addr.enemy_y_viewports),
+        enemy_y_screens=tuple(int(ram[offset]) for offset in addr.enemy_y_screens),
     )
 
 
@@ -293,6 +314,82 @@ def hop_cluster_penalty(
     return hop_cluster_penalty_scale * excess_jumps * (1.0 + progress_shortfall / max(1, hop_cluster_progress_threshold))
 
 
+def enemy_type_label(enemy_type: int) -> str:
+    mapping = {
+        0x00: "koopa",
+        0x01: "koopa",
+        0x03: "koopa",
+        0x04: "koopa",
+        0x06: "goomba",
+        0x09: "koopa",
+        0x0D: "piranha_plant",
+        0x0E: "koopa",
+        0x11: "lakitu",
+        0x12: "spiny_egg",
+        0x24: "lift",
+        0x25: "lift",
+        0x26: "lift",
+        0x27: "lift",
+        0x28: "lift",
+        0x29: "lift",
+        0x2A: "lift",
+        0x2B: "lift",
+        0x2C: "lift",
+        0x2D: "bowser",
+        0x32: "spring",
+        0x37: "goomba",
+        0x38: "goomba",
+        0x3B: "koopa",
+        0x3C: "koopa",
+    }
+    return mapping.get(enemy_type, "unknown")
+
+
+def nearest_enemy_ahead(metrics: SMBRamMetrics) -> dict[str, int | str] | None:
+    nearest: dict[str, int | str] | None = None
+    for slot, (drawn, enemy_type, enemy_state, page, x_screen, y_viewport, y_screen) in enumerate(
+        zip(
+            metrics.enemy_drawn,
+            metrics.enemy_types,
+            metrics.enemy_states,
+            metrics.enemy_pages,
+            metrics.enemy_x_screens,
+            metrics.enemy_y_viewports,
+            metrics.enemy_y_screens,
+            strict=True,
+        )
+    ):
+        label = enemy_type_label(enemy_type)
+        on_screen = drawn != 0 and label != "unknown" and y_viewport == 1 and 0 < x_screen < 255
+        if not on_screen:
+            continue
+        dx = x_screen - metrics.player_x_screen
+        if dx <= 0:
+            continue
+        candidate = {
+            "slot": slot,
+            "label": label,
+            "dx": dx,
+            "enemy_type": enemy_type,
+            "enemy_state": enemy_state,
+            "page": page,
+            "x_screen": x_screen,
+            "y_screen": y_screen,
+        }
+        if nearest is None or int(candidate["dx"]) < int(nearest["dx"]):
+            nearest = candidate
+    return nearest
+
+
+def is_pipe_stall(metrics: SMBRamMetrics, progress_window_gain_value: int, reward_config: RewardConfig) -> bool:
+    return (
+        not metrics.airborne
+        and metrics.player_x_screen >= reward_config.pipe_stall_screen_x_threshold
+        and metrics.x_speed < reward_config.pipe_stall_speed_threshold
+        and progress_window_gain_value < reward_config.pipe_stall_progress_threshold
+    )
+
+
 def defeated_enemy_count(previous: SMBRamMetrics, current: SMBRamMetrics) -> int:
     defeated_states = {0x09, 0x0B, 0x1F}
     defeats = 0
@@ -320,6 +417,8 @@ def behavior_reward_parts(
     completed_jump_height: int | None,
     completed_jump_progress: int | None,
     completed_jump_landing_delta_y: int | None,
+    nearest_enemy_dx: int | None,
+    pipe_stall_detected: bool,
 ) -> dict[str, float]:
     reward_parts: dict[str, float] = {}
 
@@ -377,6 +476,13 @@ def behavior_reward_parts(
         if avg_x_speed < 16.0 or not is_moving_right:
             reward_parts["jump_idle_penalty"] = -reward_config.jump_idle_penalty
 
+    if nearest_enemy_dx is not None and nearest_enemy_dx <= reward_config.enemy_immediate_dx_threshold:
+        if not jump_action_active and not current.airborne:
+            reward_parts["enemy_ignore_penalty"] = -reward_config.enemy_ignore_penalty
+
+    if pipe_stall_detected and not jump_action_active:
+        reward_parts["pipe_stall_choice_penalty"] = -reward_config.pipe_stall_choice_penalty
+
     return reward_parts
 
 
@@ -400,6 +506,8 @@ def compute_reward_transition(
     completed_jump_height: int | None = None,
     completed_jump_progress: int | None = None,
     completed_jump_landing_delta_y: int | None = None,
+    nearest_enemy_dx: int | None = None,
+    pipe_stall_detected: bool = False,
 ) -> RewardTransition:
     reward = 0.0
     reward_parts: dict[str, float] = {}
@@ -474,6 +582,8 @@ def compute_reward_transition(
             completed_jump_height=completed_jump_height,
             completed_jump_progress=completed_jump_progress,
             completed_jump_landing_delta_y=completed_jump_landing_delta_y,
+            nearest_enemy_dx=nearest_enemy_dx,
+            pipe_stall_detected=pipe_stall_detected,
         )
     )
     reward += sum(
@@ -489,6 +599,8 @@ def compute_reward_transition(
             "landing_spot_bonus",
             "jump_no_progress_penalty",
             "jump_idle_penalty",
+            "enemy_ignore_penalty",
+            "pipe_stall_choice_penalty",
         }
     )
 
@@ -622,6 +734,12 @@ class NESMarioBrosEnv(gym.Env):
         hop_cluster_count_threshold: int = 4,
         hop_cluster_progress_threshold: int = 24,
         stomp_bonus: float = 3.0,
+        enemy_ignore_penalty: float = 0.16,
+        enemy_immediate_dx_threshold: int = 18,
+        pipe_stall_choice_penalty: float = 0.2,
+        pipe_stall_screen_x_threshold: int = 100,
+        pipe_stall_speed_threshold: int = 5,
+        pipe_stall_progress_threshold: int = 12,
         enable_long_jumps: bool = True,
         macro_jump_hold_frames: int = 6,
         macro_jump_release_frames: int = 1,
@@ -675,6 +793,12 @@ class NESMarioBrosEnv(gym.Env):
             hop_cluster_count_threshold=hop_cluster_count_threshold,
             hop_cluster_progress_threshold=hop_cluster_progress_threshold,
             stomp_bonus=stomp_bonus,
+            enemy_ignore_penalty=enemy_ignore_penalty,
+            enemy_immediate_dx_threshold=enemy_immediate_dx_threshold,
+            pipe_stall_choice_penalty=pipe_stall_choice_penalty,
+            pipe_stall_screen_x_threshold=pipe_stall_screen_x_threshold,
+            pipe_stall_speed_threshold=pipe_stall_speed_threshold,
+            pipe_stall_progress_threshold=pipe_stall_progress_threshold,
         )
         self._addresses = SMBRamAddresses()
 
@@ -703,6 +827,9 @@ class NESMarioBrosEnv(gym.Env):
         self._last_completed_jump_height = 0
         self._last_completed_jump_progress = 0
         self._last_completed_jump_landing_delta_y = 0
+        self._event_log: deque[dict[str, Any]] = deque(maxlen=32)
+        self._event_seq = 0
+        self._seen_event_keys: set[str] = set()
 
         self._load_backend()
         self._boot_to_level_start()
@@ -783,6 +910,8 @@ class NESMarioBrosEnv(gym.Env):
         avg_x_speed: float = 0.0,
         current_jump_height: int = 0,
         current_jump_progress: int = 0,
+        nearest_enemy: dict[str, int | str] | None = None,
+        pipe_stall_detected: bool = False,
     ) -> dict[str, Any]:
         info = metrics.to_info()
         info.update(
@@ -804,11 +933,75 @@ class NESMarioBrosEnv(gym.Env):
                 "last_completed_jump_height": self._last_completed_jump_height,
                 "last_completed_jump_progress": self._last_completed_jump_progress,
                 "last_completed_jump_landing_delta_y": self._last_completed_jump_landing_delta_y,
+                "nearest_enemy": nearest_enemy,
+                "pipe_stall_detected": pipe_stall_detected,
+                "last_event": self._event_log[-1] if self._event_log else None,
                 "reward_parts": reward_parts,
                 "render_mode": self.render_mode,
             }
         )
         return info
+
+    def _append_event(self, event_type: str, metrics: SMBRamMetrics, **payload: Any) -> None:
+        self._event_seq += 1
+        event = {
+            "id": self._event_seq,
+            "type": event_type,
+            "episode_steps": self._episode_steps,
+            "progress": metrics.progress,
+            "level_progress": metrics.level_progress,
+            "world_display": metrics.world_display,
+            "level_display": metrics.level_display,
+            "area_offset": metrics.area_offset,
+            "player_x_screen": metrics.player_x_screen,
+            "player_y_screen": metrics.player_y_screen,
+            **payload,
+        }
+        self._event_log.append(event)
+
+    def _maybe_record_behavior_events(
+        self,
+        metrics: SMBRamMetrics,
+        *,
+        nearest_enemy: dict[str, int | str] | None,
+        pipe_stall_detected: bool,
+        termination_reason: str | None,
+    ) -> None:
+        if nearest_enemy is not None and "first_enemy_seen" not in self._seen_event_keys:
+            self._append_event(
+                "first_enemy_seen",
+                metrics,
+                enemy_label=nearest_enemy["label"],
+                enemy_dx=nearest_enemy["dx"],
+                enemy_slot=nearest_enemy["slot"],
+            )
+            self._seen_event_keys.add("first_enemy_seen")
+
+        if nearest_enemy is not None and int(nearest_enemy["dx"]) <= self.reward_config.enemy_immediate_dx_threshold:
+            event_key = "critical_enemy_seen"
+            if event_key not in self._seen_event_keys:
+                self._append_event(
+                    "critical_enemy_seen",
+                    metrics,
+                    enemy_label=nearest_enemy["label"],
+                    enemy_dx=nearest_enemy["dx"],
+                    enemy_slot=nearest_enemy["slot"],
+                )
+                self._seen_event_keys.add(event_key)
+
+        if pipe_stall_detected and "pipe_stall" not in self._seen_event_keys:
+            self._append_event("pipe_stall", metrics, x_speed=metrics.x_speed)
+            self._seen_event_keys.add("pipe_stall")
+
+        if termination_reason == "death" and nearest_enemy is not None:
+            self._append_event(
+                "death_near_enemy",
+                metrics,
+                enemy_label=nearest_enemy["label"],
+                enemy_dx=nearest_enemy["dx"],
+            )
+        elif termination_reason == "stagnation" and pipe_stall_detected:
+            self._append_event("stagnation_at_pipe", metrics, x_speed=metrics.x_speed)
 
     @property
     def action_names(self) -> tuple[str, ...]:
@@ -845,6 +1038,9 @@ class NESMarioBrosEnv(gym.Env):
         self._last_completed_jump_height = 0
         self._last_completed_jump_progress = 0
         self._last_completed_jump_landing_delta_y = 0
+        self._event_log.clear()
+        self._event_seq = 0
+        self._seen_event_keys.clear()
         self._last_frame = np.array(frame, copy=True)
 
         self._render_human_if_needed()
@@ -858,6 +1054,8 @@ class NESMarioBrosEnv(gym.Env):
             avg_x_speed=float(metrics.x_speed),
             current_jump_height=0,
             current_jump_progress=0,
+            nearest_enemy=nearest_enemy_ahead(metrics),
+            pipe_stall_detected=False,
         )
 
     def step(self, action: int):
@@ -890,6 +1088,9 @@ class NESMarioBrosEnv(gym.Env):
         stagnation_window_ready = len(self._progress_window) == self._progress_window.maxlen
         jump_window_count = sum(self._jump_window)
         avg_x_speed = sum(self._speed_window) / max(1, len(self._speed_window))
+        nearest_enemy = nearest_enemy_ahead(current_metrics)
+        nearest_enemy_dx = int(nearest_enemy["dx"]) if nearest_enemy is not None else None
+        pipe_stall_detected = is_pipe_stall(current_metrics, stagnation_window_gain_value, self.reward_config)
         progress_delta = current_metrics.progress - self._last_metrics.progress
         if jump_action_active and progress_delta <= 0:
             next_jump_no_progress_steps = self._jump_no_progress_steps + 1
@@ -942,6 +1143,8 @@ class NESMarioBrosEnv(gym.Env):
             completed_jump_height=completed_jump_height,
             completed_jump_progress=completed_jump_progress,
             completed_jump_landing_delta_y=completed_jump_landing_delta_y,
+            nearest_enemy_dx=nearest_enemy_dx,
+            pipe_stall_detected=pipe_stall_detected,
         )
         self._stagnation_steps = transition.stagnation_steps
         self._furthest_campaign_progress = max(self._furthest_campaign_progress, current_metrics.campaign_progress)
@@ -964,6 +1167,12 @@ class NESMarioBrosEnv(gym.Env):
             max_episode_steps=self.max_episode_steps,
             stagnation_steps=self._stagnation_steps,
         )
+        self._maybe_record_behavior_events(
+            current_metrics,
+            nearest_enemy=nearest_enemy,
+            pipe_stall_detected=pipe_stall_detected,
+            termination_reason=termination_reason,
+        )
 
         self._last_metrics = current_metrics
         self._last_frame = np.array(frame, copy=True)
@@ -983,6 +1192,8 @@ class NESMarioBrosEnv(gym.Env):
                 avg_x_speed=avg_x_speed,
                 current_jump_height=current_jump_height,
                 current_jump_progress=current_jump_progress,
+                nearest_enemy=nearest_enemy,
+                pipe_stall_detected=pipe_stall_detected,
             ),
         )
 

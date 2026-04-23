@@ -258,6 +258,7 @@ class NESSMBTrainingStatsCallback(BaseCallback):
         self._latest_level_x = 0
         self._latest_furthest_x = 0
         self._last_termination_reason: str | None = None
+        self._last_event_id = 0
 
     @staticmethod
     def _button_tokens(action_name: str) -> tuple[str, ...]:
@@ -301,6 +302,28 @@ class NESSMBTrainingStatsCallback(BaseCallback):
             termination_reason = info.get("termination_reason")
             if termination_reason:
                 self._last_termination_reason = str(termination_reason)
+
+            last_event = info.get("last_event")
+            if isinstance(last_event, dict):
+                event_id = int(last_event.get("id", 0) or 0)
+                if event_id > self._last_event_id:
+                    self._last_event_id = event_id
+                    if self.verbose > 0:
+                        location = (
+                            f"W{int(last_event.get('world_display', 1) or 1)}-"
+                            f"{int(last_event.get('level_display', 1) or 1)}"
+                        )
+                        detail = ""
+                        if "enemy_label" in last_event:
+                            detail += f" enemy={last_event['enemy_label']}"
+                        if "enemy_dx" in last_event:
+                            detail += f" dx={last_event['enemy_dx']}"
+                        if "x_speed" in last_event:
+                            detail += f" x_speed={last_event['x_speed']}"
+                        print(
+                            f"[NES-SMB event] {location} type={last_event.get('type')} "
+                            f"step={last_event.get('episode_steps')} x={last_event.get('level_progress')}{detail}"
+                        )
 
         return True
 
