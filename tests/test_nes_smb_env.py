@@ -207,6 +207,39 @@ def test_compute_reward_transition_rewards_grounded_run():
     assert transition.reward_parts["run_ground_bonus"] > 0
 
 
+def test_compute_reward_transition_rewards_full_speed_ground_run():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 120
+    ram_prev[0x0755] = 120
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+    ram_prev[0x0057] = 47
+    ram_prev[0x07F8] = 3
+
+    ram_curr[:] = ram_prev
+    ram_curr[0x0086] = 126
+    ram_curr[0x0755] = 126
+    ram_curr[0x0057] = 48
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+    transition = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(full_speed_ground_bonus=0.12, full_speed_x_threshold=47, full_speed_run_steps=12),
+        stagnation_steps=0,
+        grounded_run_steps=12,
+        avg_x_speed=47.5,
+        is_moving_right=True,
+        is_running_right=True,
+    )
+
+    assert transition.reward_parts["full_speed_ground_bonus"] == pytest.approx(0.12)
+
+
 def test_compute_reward_transition_penalizes_short_jump_only_below_threshold():
     ram_prev = _make_ram()
     ram_curr = _make_ram()

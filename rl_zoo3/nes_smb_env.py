@@ -109,6 +109,9 @@ class RewardConfig:
     jump_idle_penalty: float = 0.12
     jump_start_penalty: float = 0.3
     run_ground_bonus: float = 0.04
+    full_speed_ground_bonus: float = 0.12
+    full_speed_x_threshold: int = 47
+    full_speed_run_steps: int = 12
     min_jump_speed: float = 24.0
     min_run_steps: int = 6
     short_jump_penalty: float = 0.06
@@ -325,6 +328,11 @@ def behavior_reward_parts(
         streak_scale = min(1.0 + 0.15 * max(0, grounded_run_steps - 1), 2.5)
         grounded_run_bonus = streak_scale * (reward_config.run_ground_bonus + max(0.0, avg_x_speed - 16.0) * 0.004)
         reward_parts["run_ground_bonus"] = grounded_run_bonus
+        if (
+            current.x_speed >= reward_config.full_speed_x_threshold
+            and grounded_run_steps >= reward_config.full_speed_run_steps
+        ):
+            reward_parts["full_speed_ground_bonus"] = reward_config.full_speed_ground_bonus
 
     if jump_started and not was_airborne:
         speed_deficit = max(0.0, reward_config.min_jump_speed - avg_x_speed)
@@ -474,6 +482,7 @@ def compute_reward_transition(
         if name
         in {
             "run_ground_bonus",
+            "full_speed_ground_bonus",
             "jump_start_penalty",
             "short_jump_penalty",
             "good_jump_bonus",
@@ -596,6 +605,9 @@ class NESMarioBrosEnv(gym.Env):
         jump_idle_penalty: float = 0.12,
         jump_start_penalty: float = 0.3,
         run_ground_bonus: float = 0.04,
+        full_speed_ground_bonus: float = 0.12,
+        full_speed_x_threshold: int = 47,
+        full_speed_run_steps: int = 12,
         min_jump_speed: float = 24.0,
         min_run_steps: int = 6,
         short_jump_penalty: float = 0.06,
@@ -646,6 +658,9 @@ class NESMarioBrosEnv(gym.Env):
             jump_idle_penalty=jump_idle_penalty,
             jump_start_penalty=jump_start_penalty,
             run_ground_bonus=run_ground_bonus,
+            full_speed_ground_bonus=full_speed_ground_bonus,
+            full_speed_x_threshold=full_speed_x_threshold,
+            full_speed_run_steps=full_speed_run_steps,
             min_jump_speed=min_jump_speed,
             min_run_steps=min_run_steps,
             short_jump_penalty=short_jump_penalty,
