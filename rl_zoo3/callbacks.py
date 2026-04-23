@@ -288,8 +288,16 @@ class NESSMBTrainingStatsCallback(BaseCallback):
             detail += f" stagnation_steps={last_event['stagnation_steps']}"
         if "stagnation_window_gain" in last_event:
             detail += f" gain={last_event['stagnation_window_gain']}"
+        if "furthest_window_gain" in last_event:
+            detail += f" furthest_gain={last_event['furthest_window_gain']}"
+        if "direction_changes" in last_event:
+            detail += f" dir_changes={last_event['direction_changes']}"
         if "furthest_gap" in last_event:
             detail += f" furthest_gap={last_event['furthest_gap']}"
+        if "hop_count" in last_event:
+            detail += f" hop_count={last_event['hop_count']}"
+        if "timer_window" in last_event:
+            detail += f" timer_window={last_event['timer_window']}"
         if "speed_trace" in last_event:
             detail += f" speed_trace={last_event['speed_trace']}"
         if "progress_trace" in last_event:

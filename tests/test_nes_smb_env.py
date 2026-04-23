@@ -13,12 +13,16 @@ from rl_zoo3.nes_smb_env import (
     build_metrics_from_ram,
     compute_reward_transition,
     defeated_enemy_count,
+    direction_change_count,
     derive_termination_reason,
+    furthest_progress_gain,
     hop_cluster_penalty,
     is_pipe_stall,
     jump_window_penalty,
     movement_trace_payload,
     nearest_enemy_ahead,
+    oscillation_detected,
+    prune_jump_timer_window,
     progress_window_gain,
 )
 
@@ -100,7 +104,10 @@ def test_stagnation_event_includes_trace_fields():
         pipe_stall_detected=False,
         stagnation_steps=3,
         stagnation_window_gain_value=6,
+        furthest_window_gain_value=2,
+        direction_changes=5,
         furthest_level_progress=180,
+        hop_count=0,
         termination_reason=None,
     )
 
@@ -108,8 +115,26 @@ def test_stagnation_event_includes_trace_fields():
     assert event["type"] == "stagnation_detected"
     assert event["stagnation_steps"] == 3
     assert event["stagnation_window_gain"] == 6
+    assert event["furthest_window_gain"] == 2
+    assert event["direction_changes"] == 5
     assert event["furthest_gap"] == 60
     assert event["speed_trace"] == [48, 12, 3]
+
+
+def test_furthest_progress_gain_direction_changes_and_timer_prune():
+    assert furthest_progress_gain([620, 620, 622, 622]) == 2
+    assert direction_change_count([6, -4, 3, -2, 0, 5]) == 4
+
+    jump_timers = deque([320, 315, 299])
+    prune_jump_timer_window(jump_timers, current_timer=298, timer_window=20)
+
+    assert list(jump_timers) == [315, 299]
+    assert oscillation_detected(
+        furthest_window_gain_value=2,
+        direction_changes=5,
+        furthest_gap=40,
+        reward_config=RewardConfig(),
+    )
 
 
 def test_compute_reward_transition_progress_and_coin():
@@ -520,6 +545,31 @@ def test_compute_reward_transition_penalizes_pipe_stall_choice():
     assert transition.reward_parts["pipe_stall_choice_penalty"] == pytest.approx(-0.2)
 
 
+def test_compute_reward_transition_penalizes_hop_spam_death():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 120
+    ram_prev[0x0755] = 112
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+
+    ram_curr[:] = ram_prev
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+    transition = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(death_penalty=25.0),
+        stagnation_steps=0,
+        hop_spam_death=True,
+    )
+
+    assert transition.reward_parts["hop_spam_death_penalty"] == pytest.approx(-25.0)
+
+
 def test_progress_window_gain_and_jump_window_penalty():
     assert progress_window_gain([620, 624, 631, 629]) == 11
     assert progress_window_gain([]) == 0
@@ -566,6 +616,7 @@ def test_derive_termination_reason():
     terminated, truncated, reason = derive_termination_reason(
         metrics,
         RewardConfig(stagnation_steps=240),
+        hop_spam_death=False,
         level_complete=False,
         terminate_on_level_complete=False,
         episode_steps=10,
@@ -576,6 +627,25 @@ def test_derive_termination_reason():
     assert terminated is True
     assert truncated is False
     assert reason == "death"
+
+
+def test_derive_termination_reason_hop_spam_death():
+    metrics = build_metrics_from_ram(_make_ram())
+
+    terminated, truncated, reason = derive_termination_reason(
+        metrics,
+        RewardConfig(stagnation_steps=240),
+        hop_spam_death=True,
+        level_complete=False,
+        terminate_on_level_complete=False,
+        episode_steps=10,
+        max_episode_steps=12000,
+        stagnation_steps=0,
+    )
+
+    assert terminated is True
+    assert truncated is False
+    assert reason == "hop_spam_death"
 
 
 @pytest.mark.skipif(
