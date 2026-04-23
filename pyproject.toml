@@ -1,3 +1,30 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "stable-baselines3[extra,tests,docs]>=2.9.0a2,<3.0",
+    "box2d-py==2.3.8",
+    "cloudpickle>=2.2.1",
+    "optunahub>=0.2.0",
+    "plotly",
+    "wandb",
+    "moviepy>=1.0.0",
+    "seaborn",
+    "rliable~=1.2.0",
+    "scipy~=1.10",
+    "pandas>=2.2",
+    "mujoco>=2.3,<4",
+    "highway-env>=1.10.1,<1.11.0",
+    "build>=1.2.2",
+    "twine>=6.0.0",
+]
+
+extra-envs = [
+    "pybullet_envs_gymnasium>=0.6.0",
+]
+
 [tool.ruff]
 # Same as Black.
 line-length = 127

@@ -47,12 +47,36 @@ pip install rl_zoo3
 
 Note: you can do `python -m rl_zoo3.train` from any folder and you have access to `rl_zoo3` command line interface, for instance, `rl_zoo3 train` is equivalent to `python train.py`
 
+## Development workflow for this fork
+
+This fork uses `mise` + `uv` as the canonical contributor setup.
+From the repository root:
+
+```bash
+brew install swig cmake ffmpeg  # macOS
+mise trust
+mise install
+mise run setup
+```
+
+Common local tasks:
+
+- `mise run setup` installs the project, extras, and contributor dependencies
+- `mise run setup-full` also installs optional extra environment packages
+- `mise run test` runs the default pytest suite
+- `mise run lint` runs the Ruff checks
+- `mise run type` runs mypy
+- `mise run build` builds source and wheel distributions
+
 ### Full installation (with extra envs and test dependencies)
 
+Prerequisites:
+
+- macOS: `brew install swig cmake ffmpeg`
+- Debian/Ubuntu: `apt-get install swig cmake ffmpeg`
+
 ```
-apt-get install swig cmake ffmpeg
-pip install -r requirements.txt
-pip install -e .[plots,tests]
+mise run setup-full
 ```
 
 Please see [Stable Baselines3 documentation](https://stable-baselines3.readthedocs.io/en/master/) for alternatives to install stable baselines3.

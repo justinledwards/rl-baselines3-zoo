@@ -1,0 +1,57 @@
+[tools]
+python = "3.12"
+uv = "latest"
+
+[settings]
+python.uv_venv_auto = "create|source"
+
+[tasks.setup]
+description = "Install the project, extras, and contributor dependencies with uv"
+alias = ["bootstrap", "install"]
+run = "git submodule update --init --recursive && uv sync --group dev && uv pip install -e '.[plots,tests]'"
+
+[tasks.setup-full]
+description = "Install contributor dependencies plus optional extra environment packages"
+run = "git submodule update --init --recursive && uv sync --group dev --group extra-envs && uv pip install -e '.[plots,tests]'"
+
+[tasks.test]
+description = "Run the default pytest suite"
+run = "uv run python -m pytest --cov-config .coveragerc --cov-report html --cov-report term --cov=. -v -m 'not slow' --color=yes"
+
+[tasks.lint]
+description = "Run ruff lint checks"
+run = "uv run ruff check *.py tests/ scripts/ rl_zoo3/ hyperparams/python/*.py docs/conf.py --select=E9,F63,F7,F82 --output-format=full && uv run ruff check *.py tests/ scripts/ rl_zoo3/ hyperparams/python/*.py docs/conf.py --exit-zero --output-format=concise"
+
+[tasks.type]
+description = "Run mypy checks"
+run = "uv run mypy *.py tests/ scripts/ rl_zoo3/ hyperparams/python/*.py docs/conf.py --install-types --non-interactive"
+
+[tasks.format]
+description = "Format Python code"
+run = "uv run ruff check --select I *.py tests/ scripts/ rl_zoo3/ hyperparams/python/*.py docs/conf.py --fix && uv run black *.py tests/ scripts/ rl_zoo3/ hyperparams/python/*.py docs/conf.py"
+
+[tasks.check-codestyle]
+description = "Check import order and black formatting without modifying files"
+run = "uv run ruff check --select I *.py tests/ scripts/ rl_zoo3/ hyperparams/python/*.py docs/conf.py && uv run black --check *.py tests/ scripts/ rl_zoo3/ hyperparams/python/*.py docs/conf.py"
+
+[tasks.doc]
+description = "Build the Sphinx documentation"
+run = "uv run --directory docs make html"
+
+[tasks.build]
+description = "Build source and wheel distributions with uv"
+run = "uv build"
+
+[tasks.clean]
+description = "Remove common build and test artifacts"
+run = '''
+#!/usr/bin/env bash
+rm -rf .pytest_cache .coverage .coverage.* htmlcov dist build _build
+find . -name "*.egg-info" -prune -exec rm -rf {} +
+find . -name "__pycache__" -type d -prune -exec rm -rf {} +
+find . -name "*.pyc" -delete
+'''
+
+[tasks.ci]
+description = "Run the default local verification steps"
+depends = ["test", "lint", "type", "build"]

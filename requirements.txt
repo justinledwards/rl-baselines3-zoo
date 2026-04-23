@@ -1,4 +1,4 @@
-gym==0.26.2
+gymnasium>=0.29.1,<1.3.0
 stable-baselines3[extra,tests,docs]>=2.9.0a2,<3.0
 box2d-py==2.3.8
 pybullet_envs_gymnasium>=0.6.0
@@ -8,7 +8,5 @@ cloudpickle>=2.2.1
 optunahub>=0.2.0
 # optuna plots:
 plotly
-# need to upgrade to gymnasium:
-# panda-gym~=3.0.1
 wandb
 moviepy>=1.0.0
