@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -26,6 +27,26 @@ BUTTON_START = 0b00001000
 BUTTON_B = 0b00000010
 BUTTON_A = 0b00000001
 BUTTON_TOKENS = frozenset({"right", "left", "down", "up", "a", "b", "noop"})
+
+REWARD_FEATURE_FLAGS: tuple[str, ...] = (
+    "enable_progress_reward",
+    "enable_grounded_new_progress",
+    "enable_time_penalty",
+    "enable_death_penalty",
+    "enable_coin_reward",
+    "enable_powerup_reward",
+    "enable_run_ground_bonus",
+    "enable_jump_shaping",
+    "enable_good_jump_bonus",
+    "enable_stomp_bonus",
+    "enable_enemy_penalty",
+    "enable_pipe_penalty",
+    "enable_jump_window_penalty",
+    "enable_hop_cluster_penalty",
+    "enable_oscillation_penalty",
+    "enable_stagnation_penalty",
+    "enable_hop_spam_death",
+)
 
 SLIM_ACTIONS: tuple[tuple[str, tuple[str, ...], int], ...] = (
     ("noop", ("NOOP",), BUTTON_NOOP),
@@ -94,7 +115,25 @@ class SMBRamAddresses:
 
 @dataclass(frozen=True)
 class RewardConfig:
+    enable_progress_reward: bool = True
+    enable_grounded_new_progress: bool = True
+    enable_time_penalty: bool = True
+    enable_death_penalty: bool = True
+    enable_coin_reward: bool = True
+    enable_powerup_reward: bool = True
+    enable_run_ground_bonus: bool = True
+    enable_jump_shaping: bool = True
+    enable_good_jump_bonus: bool = True
+    enable_stomp_bonus: bool = True
+    enable_enemy_penalty: bool = True
+    enable_pipe_penalty: bool = True
+    enable_jump_window_penalty: bool = True
+    enable_hop_cluster_penalty: bool = True
+    enable_oscillation_penalty: bool = True
+    enable_stagnation_penalty: bool = True
+    enable_hop_spam_death: bool = True
     progress_scale: float = 1.0 / 12.0
+    airborne_progress_scale: float = 0.5
     time_penalty: float = 0.01
     death_penalty: float = 25.0
     airborne_death_penalty: float = 20.0
@@ -144,6 +183,7 @@ class RewardConfig:
     pipe_stall_screen_x_threshold: int = 100
     pipe_stall_speed_threshold: int = 5
     pipe_stall_progress_threshold: int = 12
+    grounded_new_progress_scale: float = 1.0 / 30.0
 
 
 @dataclass(frozen=True)
@@ -221,6 +261,69 @@ class RewardTransition:
     level_complete: bool
     jump_window_count: int
     stagnation_window_gain: int
+
+
+@dataclass(frozen=True)
+class ProgressTransition:
+    raw_delta: int
+    new_furthest_delta: int
+    furthest_gap: int
+    window_gain: int
+    furthest_window_gain: int
+
+    @classmethod
+    def from_metrics(
+        cls,
+        *,
+        previous: SMBRamMetrics,
+        current: SMBRamMetrics,
+        previous_furthest_campaign_progress: int,
+        previous_furthest_level_progress: int,
+        progress_window: Sequence[int],
+        furthest_progress_window: Sequence[int],
+    ) -> ProgressTransition:
+        return cls(
+            raw_delta=current.campaign_progress - previous.campaign_progress,
+            new_furthest_delta=max(0, current.campaign_progress - previous_furthest_campaign_progress),
+            furthest_gap=max(0, previous_furthest_level_progress - current.level_progress),
+            window_gain=progress_window_gain(progress_window),
+            furthest_window_gain=furthest_progress_gain(furthest_progress_window),
+        )
+
+
+@dataclass(frozen=True)
+class JumpTransition:
+    action_active: bool
+    started: bool
+    was_airborne: bool
+    window_count: int
+    no_progress_steps: int
+    hop_spam_death: bool
+    completed_height: int | None = None
+    completed_progress: int | None = None
+    completed_landing_delta_y: int | None = None
+
+
+class TerminationReason(str, Enum):
+    GAME_COMPLETE = "game_complete"
+    HOP_SPAM_DEATH = "hop_spam_death"
+    DEATH_AFTER_STAGNATION = "death_after_stagnation"
+    DEATH_AT_EPISODE_LIMIT = "death_at_episode_limit"
+    DEATH = "death"
+    LEVEL_COMPLETE = "level_complete"
+    MAX_EPISODE_STEPS = "max_episode_steps"
+    STAGNATION = "stagnation"
+
+
+@dataclass(frozen=True)
+class TerminationOutcome:
+    terminated: bool
+    truncated: bool
+    reason: TerminationReason | None
+
+    @property
+    def reason_value(self) -> str | None:
+        return self.reason.value if self.reason is not None else None
 
 
 def build_metrics_from_ram(ram: np.ndarray, addresses: SMBRamAddresses | None = None) -> SMBRamMetrics:
@@ -322,14 +425,14 @@ def jump_window_penalty(
     jump_penalty_threshold: int,
     jump_penalty_scale: float,
     jump_action_active: bool,
-    progress_delta: int,
+    productive_delta: int,
 ) -> float:
     if not jump_action_active or jump_window_count <= jump_penalty_threshold:
         return 0.0
 
     excess_jumps = jump_window_count - jump_penalty_threshold
     penalty = jump_penalty_scale * excess_jumps
-    if progress_delta > 0:
+    if productive_delta > 0:
         penalty *= 0.5
     return penalty
 
@@ -503,7 +606,7 @@ def behavior_reward_parts(
     reward_parts: dict[str, float] = {}
 
     grounded_run = is_running_right and not jump_action_active and not current.airborne
-    if grounded_run and avg_x_speed > 12.0:
+    if reward_config.enable_run_ground_bonus and grounded_run and avg_x_speed > 12.0:
         streak_scale = min(1.0 + 0.15 * max(0, grounded_run_steps - 1), 2.5)
         grounded_run_bonus = streak_scale * (reward_config.run_ground_bonus + max(0.0, avg_x_speed - 16.0) * 0.004)
         reward_parts["run_ground_bonus"] = grounded_run_bonus
@@ -513,7 +616,7 @@ def behavior_reward_parts(
         ):
             reward_parts["full_speed_ground_bonus"] = reward_config.full_speed_ground_bonus
 
-    if jump_started and not was_airborne:
+    if reward_config.enable_jump_shaping and jump_started and not was_airborne:
         speed_deficit = max(0.0, reward_config.min_jump_speed - avg_x_speed)
         run_deficit = max(0, reward_config.min_run_steps - grounded_run_steps)
         if speed_deficit > 0 or run_deficit > 0 or not is_running_right:
@@ -525,14 +628,19 @@ def behavior_reward_parts(
             )
             reward_parts["jump_start_penalty"] = -jump_start_penalty
 
-    if completed_jump_height is not None and completed_jump_height < reward_config.short_jump_height_threshold:
+    if (
+        reward_config.enable_jump_shaping
+        and completed_jump_height is not None
+        and completed_jump_height < reward_config.short_jump_height_threshold
+    ):
         short_jump_penalty = reward_config.short_jump_penalty * (
             1.0 - (completed_jump_height / max(1, reward_config.short_jump_height_threshold))
         )
         reward_parts["short_jump_penalty"] = -short_jump_penalty
 
     if (
-        completed_jump_height is not None
+        reward_config.enable_good_jump_bonus
+        and completed_jump_height is not None
         and completed_jump_progress is not None
         and completed_jump_height >= reward_config.good_jump_height_threshold
         and completed_jump_progress >= reward_config.good_jump_progress_threshold
@@ -540,14 +648,15 @@ def behavior_reward_parts(
         reward_parts["good_jump_bonus"] = reward_config.good_jump_bonus
 
     if (
-        completed_jump_landing_delta_y is not None
+        reward_config.enable_good_jump_bonus
+        and completed_jump_landing_delta_y is not None
         and completed_jump_progress is not None
         and completed_jump_landing_delta_y >= reward_config.landing_y_change_threshold
         and completed_jump_progress >= reward_config.landing_progress_threshold
     ):
         reward_parts["landing_spot_bonus"] = reward_config.landing_spot_bonus
 
-    if jump_action_active and progress_delta <= 0:
+    if reward_config.enable_jump_shaping and jump_action_active and progress_delta <= 0:
         jump_no_progress_penalty = reward_config.jump_no_progress_penalty * (
             (1 + jump_no_progress_steps) if progress_delta == 0 else (2 + jump_no_progress_steps)
         )
@@ -556,12 +665,53 @@ def behavior_reward_parts(
         if avg_x_speed < 16.0 or not is_moving_right:
             reward_parts["jump_idle_penalty"] = -reward_config.jump_idle_penalty
 
-    if nearest_enemy_dx is not None and nearest_enemy_dx <= reward_config.enemy_immediate_dx_threshold:
+    if (
+        reward_config.enable_enemy_penalty
+        and nearest_enemy_dx is not None
+        and nearest_enemy_dx <= reward_config.enemy_immediate_dx_threshold
+    ):
         if not jump_action_active and not current.airborne:
             reward_parts["enemy_ignore_penalty"] = -reward_config.enemy_ignore_penalty
 
-    if pipe_stall_detected and not jump_action_active:
+    if reward_config.enable_pipe_penalty and pipe_stall_detected and not jump_action_active:
         reward_parts["pipe_stall_choice_penalty"] = -reward_config.pipe_stall_choice_penalty
+
+    return reward_parts
+
+
+def base_reward_parts(
+    previous: SMBRamMetrics,
+    current: SMBRamMetrics,
+    reward_config: RewardConfig,
+    *,
+    jump_transition: JumpTransition,
+    level_changed: bool,
+) -> dict[str, float]:
+    reward_parts: dict[str, float] = {}
+    if reward_config.enable_time_penalty:
+        reward_parts["time_penalty"] = -reward_config.time_penalty
+
+    if reward_config.enable_hop_spam_death and jump_transition.hop_spam_death:
+        reward_parts["hop_spam_death_penalty"] = -reward_config.death_penalty
+
+    if reward_config.enable_death_penalty and current.lives < previous.lives:
+        death_delta = previous.lives - current.lives
+        death_penalty = reward_config.death_penalty * death_delta
+        reward_parts["death_penalty"] = -death_penalty
+        if jump_transition.was_airborne:
+            airborne_penalty = reward_config.airborne_death_penalty * death_delta
+            reward_parts["airborne_death_penalty"] = -airborne_penalty
+
+    if reward_config.enable_progress_reward and level_changed:
+        reward_parts["level_complete"] = reward_config.flag_bonus
+
+    coin_delta = current.coins - previous.coins
+    if reward_config.enable_coin_reward and coin_delta > 0:
+        reward_parts["coins"] = coin_delta * reward_config.coin_bonus
+
+    player_mode_delta = current.player_mode - previous.player_mode
+    if reward_config.enable_powerup_reward and player_mode_delta > 0:
+        reward_parts["powerup"] = player_mode_delta * reward_config.powerup_bonus
 
     return reward_parts
 
@@ -572,6 +722,8 @@ def compute_reward_transition(
     reward_config: RewardConfig,
     stagnation_steps: int,
     *,
+    progress_transition: ProgressTransition | None = None,
+    jump_transition: JumpTransition | None = None,
     stagnation_window_ready: bool = False,
     stagnation_window_gain_value: int = 0,
     furthest_window_gain_value: int = 0,
@@ -601,20 +753,47 @@ def compute_reward_transition(
         previous.area_offset,
     )
     level_changed = (current.world, current.level) != (previous.world, previous.level)
-    progress_delta = current.progress - previous.progress
+    if progress_transition is None:
+        progress_transition = ProgressTransition(
+            raw_delta=current.campaign_progress - previous.campaign_progress,
+            new_furthest_delta=max(0, current.campaign_progress - previous.campaign_progress),
+            furthest_gap=furthest_gap,
+            window_gain=stagnation_window_gain_value,
+            furthest_window_gain=furthest_window_gain_value,
+        )
+    if jump_transition is None:
+        jump_transition = JumpTransition(
+            action_active=jump_action_active,
+            started=jump_started,
+            was_airborne=was_airborne,
+            window_count=jump_window_count,
+            no_progress_steps=jump_no_progress_steps,
+            hop_spam_death=hop_spam_death,
+            completed_height=completed_jump_height,
+            completed_progress=completed_jump_progress,
+            completed_landing_delta_y=completed_jump_landing_delta_y,
+        )
+    progress_delta = progress_transition.raw_delta
     oscillating = oscillation_detected(
-        furthest_window_gain_value=furthest_window_gain_value,
+        furthest_window_gain_value=progress_transition.furthest_window_gain,
         direction_changes=direction_changes,
-        furthest_gap=furthest_gap,
+        furthest_gap=progress_transition.furthest_gap,
         reward_config=reward_config,
     )
 
-    if progress_delta > 0:
-        base_progress_reward = progress_delta * reward_config.progress_scale
+    if reward_config.enable_progress_reward and progress_transition.new_furthest_delta > 0:
+        progress_scale = reward_config.progress_scale
+        if current.airborne:
+            progress_scale *= reward_config.airborne_progress_scale
+        base_progress_reward = progress_transition.new_furthest_delta * progress_scale
         time_bonus = base_progress_reward * (current.timer * reward_config.time_progress_weight)
         total_progress_reward = base_progress_reward + time_bonus
         reward += total_progress_reward
         reward_parts["progress"] = total_progress_reward
+        if reward_config.enable_grounded_new_progress and not current.airborne:
+            grounded_reward = progress_transition.new_furthest_delta * reward_config.grounded_new_progress_scale
+            reward += grounded_reward
+            reward_parts["grounded_new_progress"] = grounded_reward
 
     next_stagnation_steps = next_stagnation_step_count(
         zone_changed=zone_changed,
@@ -622,61 +801,38 @@ def compute_reward_transition(
         reward_config=reward_config,
         stagnation_steps=stagnation_steps,
         stagnation_window_ready=stagnation_window_ready,
-        stagnation_window_gain_value=stagnation_window_gain_value,
-        furthest_window_gain_value=furthest_window_gain_value,
+        stagnation_window_gain_value=progress_transition.window_gain,
+        furthest_window_gain_value=progress_transition.furthest_window_gain,
         oscillating=oscillating,
         progress_delta=progress_delta,
     )
 
-    reward -= reward_config.time_penalty
-    reward_parts["time_penalty"] = -reward_config.time_penalty
-
-    if hop_spam_death:
-        reward -= reward_config.death_penalty
-        reward_parts["hop_spam_death_penalty"] = -reward_config.death_penalty
-
-    if current.lives < previous.lives:
-        death_delta = previous.lives - current.lives
-        death_penalty = reward_config.death_penalty * death_delta
-        reward -= death_penalty
-        reward_parts["death_penalty"] = -death_penalty
-        if was_airborne:
-            airborne_penalty = reward_config.airborne_death_penalty * death_delta
-            reward -= airborne_penalty
-            reward_parts["airborne_death_penalty"] = -airborne_penalty
-
-    if level_changed:
-        reward += reward_config.flag_bonus
-        reward_parts["level_complete"] = reward_config.flag_bonus
-
-    coin_delta = current.coins - previous.coins
-    if coin_delta > 0:
-        coin_reward = coin_delta * reward_config.coin_bonus
-        reward += coin_reward
-        reward_parts["coins"] = coin_reward
-
-    player_mode_delta = current.player_mode - previous.player_mode
-    if player_mode_delta > 0:
-        powerup_reward = player_mode_delta * reward_config.powerup_bonus
-        reward += powerup_reward
-        reward_parts["powerup"] = powerup_reward
+    base_parts = base_reward_parts(
+        previous,
+        current,
+        reward_config,
+        jump_transition=jump_transition,
+        level_changed=level_changed,
+    )
+    reward_parts.update(base_parts)
+    reward += sum(base_parts.values())
 
     reward_parts.update(
         behavior_reward_parts(
             current=current,
             reward_config=reward_config,
             progress_delta=progress_delta,
-            jump_action_active=jump_action_active,
-            jump_started=jump_started,
-            was_airborne=was_airborne,
+            jump_action_active=jump_transition.action_active,
+            jump_started=jump_transition.started,
+            was_airborne=jump_transition.was_airborne,
             grounded_run_steps=grounded_run_steps,
             avg_x_speed=avg_x_speed,
-            jump_no_progress_steps=jump_no_progress_steps,
+            jump_no_progress_steps=jump_transition.no_progress_steps,
             is_moving_right=is_moving_right,
             is_running_right=is_running_right,
-            completed_jump_height=completed_jump_height,
-            completed_jump_progress=completed_jump_progress,
-            completed_jump_landing_delta_y=completed_jump_landing_delta_y,
+            completed_jump_height=jump_transition.completed_height,
+            completed_jump_progress=jump_transition.completed_progress,
+            completed_jump_landing_delta_y=jump_transition.completed_landing_delta_y,
             nearest_enemy_dx=nearest_enemy_dx,
             pipe_stall_detected=pipe_stall_detected,
         )
@@ -700,38 +856,50 @@ def compute_reward_transition(
     )
 
     stomp_count = defeated_enemy_count(previous, current)
-    if stomp_count > 0:
+    if reward_config.enable_stomp_bonus and stomp_count > 0:
         stomp_bonus = stomp_count * reward_config.stomp_bonus
         reward += stomp_bonus
         reward_parts["stomp_bonus"] = stomp_bonus
 
-    excessive_jump_penalty = jump_window_penalty(
-        jump_window_count=jump_window_count,
-        jump_penalty_threshold=reward_config.jump_penalty_threshold,
-        jump_penalty_scale=reward_config.jump_penalty_scale,
-        jump_action_active=jump_action_active,
-        progress_delta=progress_delta,
+    excessive_jump_penalty = (
+        jump_window_penalty(
+            jump_window_count=jump_transition.window_count,
+            jump_penalty_threshold=reward_config.jump_penalty_threshold,
+            jump_penalty_scale=reward_config.jump_penalty_scale,
+            jump_action_active=jump_transition.action_active,
+            productive_delta=progress_transition.new_furthest_delta,
+        )
+        if reward_config.enable_jump_window_penalty
+        else 0.0
     )
     if excessive_jump_penalty > 0:
         reward -= excessive_jump_penalty
         reward_parts["jump_window_penalty"] = -excessive_jump_penalty
 
-    clustered_hop_penalty = hop_cluster_penalty(
-        jump_window_count=jump_window_count,
-        progress_window_gain_value=stagnation_window_gain_value,
-        hop_cluster_count_threshold=reward_config.hop_cluster_count_threshold,
-        hop_cluster_progress_threshold=reward_config.hop_cluster_progress_threshold,
-        hop_cluster_penalty_scale=reward_config.hop_cluster_penalty_scale,
+    clustered_hop_penalty = (
+        hop_cluster_penalty(
+            jump_window_count=jump_window_count,
+            progress_window_gain_value=progress_transition.window_gain,
+            hop_cluster_count_threshold=reward_config.hop_cluster_count_threshold,
+            hop_cluster_progress_threshold=reward_config.hop_cluster_progress_threshold,
+            hop_cluster_penalty_scale=reward_config.hop_cluster_penalty_scale,
+        )
+        if reward_config.enable_hop_cluster_penalty
+        else 0.0
     )
     if clustered_hop_penalty > 0:
         reward -= clustered_hop_penalty
         reward_parts["hop_cluster_penalty"] = -clustered_hop_penalty
 
-    if oscillating:
+    if reward_config.enable_oscillation_penalty and oscillating:
         reward -= reward_config.oscillation_penalty
         reward_parts["oscillation_penalty"] = -reward_config.oscillation_penalty
 
-    if not zone_changed and next_stagnation_steps >= reward_config.stagnation_steps:
+    if (
+        reward_config.enable_stagnation_penalty
+        and not zone_changed
+        and next_stagnation_steps >= reward_config.stagnation_steps
+    ):
         steps_over = next_stagnation_steps - reward_config.stagnation_steps
         multiplier = 1.0 + (steps_over * 0.1) ** 1.5
         stagnation_penalty = reward_config.stagnation_penalty * multiplier
@@ -743,8 +911,8 @@ def compute_reward_transition(
         reward_parts=reward_parts,
         stagnation_steps=next_stagnation_steps,
         level_complete=level_changed,
-        jump_window_count=jump_window_count,
-        stagnation_window_gain=stagnation_window_gain_value,
+        jump_window_count=jump_transition.window_count,
+        stagnation_window_gain=progress_transition.window_gain,
     )
 
 
@@ -758,35 +926,36 @@ def derive_termination_reason(
     episode_steps: int,
     max_episode_steps: int,
     stagnation_steps: int,
-) -> tuple[bool, bool, str | None]:
+) -> TerminationOutcome:
     game_complete = is_game_complete(metrics)
     dead = is_dead(metrics, reward_config)
+    effective_hop_spam_death = reward_config.enable_hop_spam_death and hop_spam_death
     hit_episode_limit = episode_steps >= max_episode_steps
     hit_stagnation = stagnation_steps >= reward_config.stagnation_steps
 
-    terminated = game_complete or dead or hop_spam_death or (terminate_on_level_complete and level_complete)
+    terminated = game_complete or dead or effective_hop_spam_death or (terminate_on_level_complete and level_complete)
     truncated = not terminated and (hit_episode_limit or hit_stagnation)
 
     if game_complete:
-        reason = "game_complete"
-    elif hop_spam_death:
-        reason = "hop_spam_death"
+        reason = TerminationReason.GAME_COMPLETE
+    elif effective_hop_spam_death:
+        reason = TerminationReason.HOP_SPAM_DEATH
     elif dead and hit_stagnation:
-        reason = "death_after_stagnation"
+        reason = TerminationReason.DEATH_AFTER_STAGNATION
     elif dead and hit_episode_limit:
-        reason = "death_at_episode_limit"
+        reason = TerminationReason.DEATH_AT_EPISODE_LIMIT
     elif dead:
-        reason = "death"
+        reason = TerminationReason.DEATH
     elif terminate_on_level_complete and level_complete:
-        reason = "level_complete"
+        reason = TerminationReason.LEVEL_COMPLETE
     elif hit_episode_limit:
-        reason = "max_episode_steps"
+        reason = TerminationReason.MAX_EPISODE_STEPS
     elif hit_stagnation:
-        reason = "stagnation"
+        reason = TerminationReason.STAGNATION
     else:
         reason = None
 
-    return terminated, truncated, reason
+    return TerminationOutcome(terminated=terminated, truncated=truncated, reason=reason)
 
 
 def action_tokens(action_name: str) -> tuple[str, ...]:
@@ -807,10 +976,29 @@ class NESMarioBrosEnv(gym.Env):
         resize_shape: tuple[int, int] = (105, 80),
         grayscale: bool = True,
         max_episode_steps: int = 12000,
+        enable_progress_reward: bool = True,
+        enable_grounded_new_progress: bool = True,
+        enable_time_penalty: bool = True,
+        enable_death_penalty: bool = True,
+        enable_coin_reward: bool = True,
+        enable_powerup_reward: bool = True,
+        enable_run_ground_bonus: bool = True,
+        enable_jump_shaping: bool = True,
+        enable_good_jump_bonus: bool = True,
+        enable_stomp_bonus: bool = True,
+        enable_enemy_penalty: bool = True,
+        enable_pipe_penalty: bool = True,
+        enable_jump_window_penalty: bool = True,
+        enable_hop_cluster_penalty: bool = True,
+        enable_oscillation_penalty: bool = True,
+        enable_stagnation_penalty: bool = True,
+        enable_hop_spam_death: bool = True,
+        airborne_progress_scale: float = 0.5,
         stagnation_steps: int = 240,
         stagnation_window: int = 48,
         stagnation_min_progress: int = 24,
         stagnation_furthest_min_progress: int = 12,
+        stagnation_penalty: float = 1.0,
         oscillation_window: int = 12,
         oscillation_direction_changes: int = 4,
         oscillation_backtrack_threshold: int = 24,
@@ -850,11 +1038,17 @@ class NESMarioBrosEnv(gym.Env):
         pipe_stall_speed_threshold: int = 5,
         pipe_stall_progress_threshold: int = 12,
         enable_long_jumps: bool = True,
+        enable_left_jump_actions: bool = True,
         macro_jump_hold_frames: int = 6,
         macro_jump_release_frames: int = 1,
         settle_frames: int = 120,
         start_press_frames: int = 10,
         start_wait_frames: int = 180,
+        grounded_new_progress_scale: float = 1.0 / 30.0,
+        debug_rewards: bool = False,
+        debug_reward_interval: int = 24,
+        debug_reward_min_abs: float = 0.05,
+        debug_enemy_distance: int = 48,
     ):
         if render_mode not in {None, "human", "rgb_array"}:
             raise ValueError(f"Unsupported render_mode: {render_mode}")
@@ -871,14 +1065,38 @@ class NESMarioBrosEnv(gym.Env):
         self.settle_frames = settle_frames
         self.start_press_frames = start_press_frames
         self.start_wait_frames = start_wait_frames
+        self.debug_rewards = debug_rewards
+        self.debug_reward_interval = max(1, debug_reward_interval)
+        self.debug_reward_min_abs = debug_reward_min_abs
+        self.debug_enemy_distance = debug_enemy_distance
         self.enable_long_jumps = enable_long_jumps
+        self.enable_left_jump_actions = enable_left_jump_actions
         self.macro_jump_hold_frames = macro_jump_hold_frames
         self.macro_jump_release_frames = macro_jump_release_frames
         self.reward_config = RewardConfig(
+            enable_progress_reward=enable_progress_reward,
+            enable_grounded_new_progress=enable_grounded_new_progress,
+            enable_time_penalty=enable_time_penalty,
+            enable_death_penalty=enable_death_penalty,
+            enable_coin_reward=enable_coin_reward,
+            enable_powerup_reward=enable_powerup_reward,
+            enable_run_ground_bonus=enable_run_ground_bonus,
+            enable_jump_shaping=enable_jump_shaping,
+            enable_good_jump_bonus=enable_good_jump_bonus,
+            enable_stomp_bonus=enable_stomp_bonus,
+            enable_enemy_penalty=enable_enemy_penalty,
+            enable_pipe_penalty=enable_pipe_penalty,
+            enable_jump_window_penalty=enable_jump_window_penalty,
+            enable_hop_cluster_penalty=enable_hop_cluster_penalty,
+            enable_oscillation_penalty=enable_oscillation_penalty,
+            enable_stagnation_penalty=enable_stagnation_penalty,
+            enable_hop_spam_death=enable_hop_spam_death,
+            airborne_progress_scale=airborne_progress_scale,
             stagnation_steps=stagnation_steps,
             stagnation_window=stagnation_window,
             stagnation_min_progress=stagnation_min_progress,
             stagnation_furthest_min_progress=stagnation_furthest_min_progress,
+            stagnation_penalty=stagnation_penalty,
             oscillation_window=oscillation_window,
             oscillation_direction_changes=oscillation_direction_changes,
             oscillation_backtrack_threshold=oscillation_backtrack_threshold,
@@ -915,6 +1133,7 @@ class NESMarioBrosEnv(gym.Env):
             pipe_stall_screen_x_threshold=pipe_stall_screen_x_threshold,
             pipe_stall_speed_threshold=pipe_stall_speed_threshold,
             pipe_stall_progress_threshold=pipe_stall_progress_threshold,
+            grounded_new_progress_scale=grounded_new_progress_scale,
         )
         self._addresses = SMBRamAddresses()
 
@@ -940,6 +1159,8 @@ class NESMarioBrosEnv(gym.Env):
         self._jump_timer_window: deque[int] = deque()
         self._prev_jump_action_active = False
         self._ground_run_steps = 0
+        self._ground_frame_counter = 0
+        self._airborne_frame_counter = 0
         self._jump_no_progress_steps = 0
         self._jump_start_y: int | None = None
         self._jump_peak_y: int | None = None
@@ -955,10 +1176,16 @@ class NESMarioBrosEnv(gym.Env):
         self._boot_to_level_start()
 
     def _build_action_specs(self) -> tuple[ActionSpec, ...]:
-        specs = [self._make_action_spec(name, buttons, mask) for name, buttons, mask in SLIM_ACTIONS]
+        specs = [
+            self._make_action_spec(name, buttons, mask)
+            for name, buttons, mask in SLIM_ACTIONS
+            if self.enable_left_jump_actions or not ("left" in name and "a" in name)
+        ]
         if self.enable_long_jumps:
             specs.extend(
-                self._make_action_spec(name, buttons, mask, long_jump=True) for name, buttons, mask in LONG_JUMP_ACTIONS
+                self._make_action_spec(name, buttons, mask, long_jump=True)
+                for name, buttons, mask in LONG_JUMP_ACTIONS
+                if self.enable_left_jump_actions or not ("left" in name and "a" in name)
             )
         return tuple(specs)
 
@@ -1025,6 +1252,7 @@ class NESMarioBrosEnv(gym.Env):
         action_name: str,
         reward_parts: dict[str, float],
         termination_reason: str | None,
+        progress_transition: ProgressTransition | None = None,
         jump_window_count: int = 0,
         stagnation_window_gain_value: int = 0,
         avg_x_speed: float = 0.0,
@@ -1033,12 +1261,31 @@ class NESMarioBrosEnv(gym.Env):
         nearest_enemy: dict[str, int | str] | None = None,
         pipe_stall_detected: bool = False,
     ) -> dict[str, Any]:
+        raw_delta = progress_transition.raw_delta if progress_transition is not None else 0
+        new_furthest_delta = progress_transition.new_furthest_delta if progress_transition is not None else 0
+        furthest_gap = progress_transition.furthest_gap if progress_transition is not None else 0
+        significant_rewards = {
+            name: value for name, value in reward_parts.items() if abs(value) >= self.debug_reward_min_abs
+        }
+        enemy_dx = int(nearest_enemy["dx"]) if nearest_enemy is not None else None
+        near_enemy = enemy_dx is not None and enemy_dx <= self.debug_enemy_distance
+        debug_due = self._episode_steps % self.debug_reward_interval == 0
+        debug_reward_line = self.debug_rewards and (
+            termination_reason is not None
+            or pipe_stall_detected
+            or near_enemy
+            or bool(significant_rewards)
+            or self._stagnation_steps > 0
+        ) and (debug_due or termination_reason is not None or pipe_stall_detected)
         info = metrics.to_info()
         info.update(
             {
                 "action_name": action_name,
                 "action_tokens": action_tokens(action_name),
                 "episode_steps": self._episode_steps,
+                "raw_progress_delta": raw_delta,
+                "new_furthest_delta": new_furthest_delta,
+                "furthest_gap": furthest_gap,
                 "furthest_progress": self._furthest_campaign_progress,
                 "furthest_level_progress": self._furthest_level_progress,
                 "stagnation_steps": self._stagnation_steps,
@@ -1046,6 +1293,12 @@ class NESMarioBrosEnv(gym.Env):
                 "termination_reason": termination_reason,
                 "jump_window_count": jump_window_count,
                 "ground_run_steps": self._ground_run_steps,
+                "ground_frame_counter": self._ground_frame_counter,
+                "airborne_frame_counter": self._airborne_frame_counter,
+                "ground_time_ratio": (
+                    self._ground_frame_counter
+                    / max(1, self._ground_frame_counter + self._airborne_frame_counter)
+                ),
                 "jump_no_progress_steps": self._jump_no_progress_steps,
                 "avg_x_speed": avg_x_speed,
                 "current_jump_height": current_jump_height,
@@ -1057,6 +1310,8 @@ class NESMarioBrosEnv(gym.Env):
                 "pipe_stall_detected": pipe_stall_detected,
                 "last_event": self._event_log[-1] if self._event_log else None,
                 "reward_parts": reward_parts,
+                "debug_reward_line": debug_reward_line,
+                "debug_reward_parts": significant_rewards,
                 "render_mode": self.render_mode,
             }
         )
@@ -1199,6 +1454,8 @@ class NESMarioBrosEnv(gym.Env):
         self._jump_timer_window.clear()
         self._prev_jump_action_active = False
         self._ground_run_steps = 0
+        self._ground_frame_counter = 0
+        self._airborne_frame_counter = 0
         self._jump_no_progress_steps = 0
         self._jump_start_y = None
         self._jump_peak_y = None
@@ -1257,23 +1514,28 @@ class NESMarioBrosEnv(gym.Env):
         self._jump_window.append(1 if jump_started else 0)
         self._speed_window.append(current_metrics.x_speed)
         self._movement_trace.append(self._trace_sample(current_metrics))
-        stagnation_window_gain_value = progress_window_gain(self._progress_window)
         stagnation_window_ready = len(self._progress_window) == self._progress_window.maxlen
-        furthest_window_gain_value = furthest_progress_gain(self._furthest_progress_window)
         jump_window_count = sum(self._jump_window)
         avg_x_speed = sum(self._speed_window) / max(1, len(self._speed_window))
         nearest_enemy = nearest_enemy_ahead(current_metrics)
         nearest_enemy_dx = int(nearest_enemy["dx"]) if nearest_enemy is not None else None
-        pipe_stall_detected = is_pipe_stall(current_metrics, stagnation_window_gain_value, self.reward_config)
-        progress_delta = current_metrics.progress - self._last_metrics.progress
+        progress_delta = current_metrics.campaign_progress - self._last_metrics.campaign_progress
         self._direction_window.append(progress_delta)
         direction_changes = direction_change_count(self._direction_window)
-        furthest_gap = max(0, self._furthest_level_progress - current_metrics.level_progress)
+        progress_transition = ProgressTransition.from_metrics(
+            previous=self._last_metrics,
+            current=current_metrics,
+            previous_furthest_campaign_progress=self._furthest_campaign_progress,
+            previous_furthest_level_progress=self._furthest_level_progress,
+            progress_window=self._progress_window,
+            furthest_progress_window=self._furthest_progress_window,
+        )
+        pipe_stall_detected = is_pipe_stall(current_metrics, progress_transition.window_gain, self.reward_config)
         if jump_started and not self._last_metrics.airborne:
             self._jump_timer_window.append(current_metrics.timer)
         prune_jump_timer_window(self._jump_timer_window, current_metrics.timer, self.reward_config.hop_death_timer_window)
         hop_spam_death = len(self._jump_timer_window) > self.reward_config.hop_death_jump_threshold
-        if jump_action_active and progress_delta <= 0:
+        if jump_action_active and progress_transition.new_furthest_delta <= 0:
             next_jump_no_progress_steps = self._jump_no_progress_steps + 1
         else:
             next_jump_no_progress_steps = 0
@@ -1305,16 +1567,33 @@ class NESMarioBrosEnv(gym.Env):
                 self._jump_start_y = None
                 self._jump_peak_y = None
                 self._jump_start_progress = None
+        if current_metrics.airborne:
+            self._airborne_frame_counter += 1
+        else:
+            self._ground_frame_counter += 1
+        jump_transition = JumpTransition(
+            action_active=jump_action_active,
+            started=jump_started,
+            was_airborne=self._last_metrics.airborne,
+            window_count=jump_window_count,
+            no_progress_steps=next_jump_no_progress_steps,
+            hop_spam_death=hop_spam_death,
+            completed_height=completed_jump_height,
+            completed_progress=completed_jump_progress,
+            completed_landing_delta_y=completed_jump_landing_delta_y,
+        )
         transition = compute_reward_transition(
             self._last_metrics,
             current_metrics,
             self.reward_config,
             self._stagnation_steps,
+            progress_transition=progress_transition,
+            jump_transition=jump_transition,
             stagnation_window_ready=stagnation_window_ready,
-            stagnation_window_gain_value=stagnation_window_gain_value,
-            furthest_window_gain_value=furthest_window_gain_value,
+            stagnation_window_gain_value=progress_transition.window_gain,
+            furthest_window_gain_value=progress_transition.furthest_window_gain,
             direction_changes=direction_changes,
-            furthest_gap=furthest_gap,
+            furthest_gap=progress_transition.furthest_gap,
             jump_window_count=jump_window_count,
             jump_action_active=jump_action_active,
             jump_started=jump_started,
@@ -1343,7 +1622,7 @@ class NESMarioBrosEnv(gym.Env):
             self._ground_run_steps = 0
         self._jump_no_progress_steps = next_jump_no_progress_steps
         self._prev_jump_action_active = jump_action_active
-        terminated, truncated, termination_reason = derive_termination_reason(
+        termination = derive_termination_reason(
             current_metrics,
             self.reward_config,
             hop_spam_death=hop_spam_death,
@@ -1353,13 +1632,14 @@ class NESMarioBrosEnv(gym.Env):
             max_episode_steps=self.max_episode_steps,
             stagnation_steps=self._stagnation_steps,
         )
+        termination_reason = termination.reason_value
         self._maybe_record_behavior_events(
             current_metrics,
             nearest_enemy=nearest_enemy,
             pipe_stall_detected=pipe_stall_detected,
             stagnation_steps=transition.stagnation_steps,
             stagnation_window_gain_value=transition.stagnation_window_gain,
-            furthest_window_gain_value=furthest_window_gain_value,
+            furthest_window_gain_value=progress_transition.furthest_window_gain,
             direction_changes=direction_changes,
             furthest_level_progress=self._furthest_level_progress,
             hop_count=len(self._jump_timer_window),
@@ -1372,13 +1652,14 @@ class NESMarioBrosEnv(gym.Env):
         return (
             self._preprocess(self._last_frame),
             float(transition.reward),
-            terminated,
-            truncated,
+            termination.terminated,
+            termination.truncated,
             self._build_info(
                 current_metrics,
                 action_name=action_spec.name,
                 reward_parts=transition.reward_parts,
                 termination_reason=termination_reason,
+                progress_transition=progress_transition,
                 jump_window_count=transition.jump_window_count,
                 stagnation_window_gain_value=transition.stagnation_window_gain,
                 avg_x_speed=avg_x_speed,

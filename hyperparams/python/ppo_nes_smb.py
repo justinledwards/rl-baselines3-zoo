@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hyperparams.python.nes_smb_env_preset import EVAL_ENV_KWARGS, TRAIN_ENV_KWARGS
 from rl_zoo3.callbacks import NESSMBTrainingStatsCallback
 
 hyperparams = {
@@ -18,6 +19,8 @@ hyperparams = {
         ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
+        env_kwargs=TRAIN_ENV_KWARGS,
+        eval_env_kwargs=EVAL_ENV_KWARGS,
         callback=[NESSMBTrainingStatsCallback(verbose=1)],
     )
 }

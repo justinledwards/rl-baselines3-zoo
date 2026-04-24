@@ -372,6 +372,10 @@ class ExperimentManager:
             if self._eval_env_kwargs_args is None:
                 self.eval_env_kwargs = hyperparams["env_kwargs"]
 
+        if "eval_env_kwargs" in hyperparams and self._eval_env_kwargs_args is not None:
+            # Command line argument should overwrite config
+            hyperparams.update({"eval_env_kwargs": self._eval_env_kwargs_args})
+
         # Sort hyperparams that will be saved
         saved_hyperparams = OrderedDict([(key, hyperparams[key]) for key in sorted(hyperparams.keys())])
 
@@ -492,6 +496,10 @@ class ExperimentManager:
         if "env_kwargs" in hyperparams.keys():
             self.env_kwargs = hyperparams["env_kwargs"]
             del hyperparams["env_kwargs"]
+
+        if "eval_env_kwargs" in hyperparams.keys():
+            self.eval_env_kwargs = hyperparams["eval_env_kwargs"]
+            del hyperparams["eval_env_kwargs"]
 
         # Delete keys so the dict can be pass to the model constructor
         if "n_envs" in hyperparams.keys():

@@ -247,6 +247,7 @@ class NESSMBTrainingStatsCallback(BaseCallback):
         super().__init__(verbose)
         self._rollout_action_counts: Counter[str] = Counter()
         self._rollout_button_counts: Counter[str] = Counter()
+        self._rollout_reward_parts: Counter[str] = Counter()
         self._episode_rewards: list[float] = []
         self._episode_lengths: list[int] = []
         self._max_world = 0
@@ -257,6 +258,7 @@ class NESSMBTrainingStatsCallback(BaseCallback):
         self._latest_level = 0
         self._latest_level_x = 0
         self._latest_furthest_x = 0
+        self._latest_ground_time_ratio = 0.0
         self._last_termination_reason: str | None = None
         self._last_event_id = 0
 
@@ -312,16 +314,23 @@ class NESSMBTrainingStatsCallback(BaseCallback):
                 for token in self._button_tokens(action_name):
                     self._rollout_button_counts[token] += 1
 
+            reward_parts = info.get("reward_parts")
+            if isinstance(reward_parts, dict):
+                for name, value in reward_parts.items():
+                    self._rollout_reward_parts[str(name)] += float(value)
+
             world_display = int(info.get("world_display", 0) or 0)
             level_display = int(info.get("level_display", 0) or 0)
             level_progress = int(info.get("level_progress", 0) or 0)
             furthest_level_progress = int(info.get("furthest_level_progress", 0) or 0)
             campaign_progress = int(info.get("furthest_progress", 0) or 0)
+            ground_time_ratio = float(info.get("ground_time_ratio", 0.0) or 0.0)
 
             self._latest_world = world_display or self._latest_world
             self._latest_level = level_display or self._latest_level
             self._latest_level_x = level_progress
             self._latest_furthest_x = furthest_level_progress
+            self._latest_ground_time_ratio = ground_time_ratio
 
             self._max_world = max(self._max_world, world_display)
             self._max_level = max(self._max_level, level_display)
@@ -349,6 +358,23 @@ class NESSMBTrainingStatsCallback(BaseCallback):
                             f"step={last_event.get('episode_steps')} x={last_event.get('level_progress')}{detail}"
                         )
 
+            if info.get("debug_reward_line"):
+                nearest_enemy = info.get("nearest_enemy")
+                enemy = ""
+                if isinstance(nearest_enemy, dict):
+                    enemy = f" enemy={nearest_enemy.get('label')} dx={nearest_enemy.get('dx')}"
+                parts = info.get("debug_reward_parts") or {}
+                reward_summary = " ".join(
+                    f"{name}:{float(value):+.2f}" for name, value in sorted(parts.items(), key=lambda item: item[0])
+                )
+                print(
+                    f"[NES-SMB reward] W{world_display or 1}-{level_display or 1} "
+                    f"step={info.get('episode_steps')} x={level_progress} action={action_name} "
+                    f"raw_dx={info.get('raw_progress_delta')} new_dx={info.get('new_furthest_delta')} "
+                    f"stagnation={info.get('stagnation_steps')} jump_window={info.get('jump_window_count')}"
+                    f"{enemy} parts[{reward_summary or 'none'}]"
+                )
+
         return True
 
     def _on_rollout_end(self) -> None:
@@ -360,10 +386,15 @@ class NESSMBTrainingStatsCallback(BaseCallback):
             for button_name, count in sorted(self._rollout_button_counts.items()):
                 self.logger.record(f"buttons/{button_name}", count)
 
+        if self._rollout_reward_parts:
+            for part_name, total in sorted(self._rollout_reward_parts.items()):
+                self.logger.record(f"reward_parts/{part_name}", total)
+
         self.logger.record("progress/max_world", self._max_world)
         self.logger.record("progress/max_level", self._max_level)
         self.logger.record("progress/max_level_x", self._max_level_x)
         self.logger.record("progress/max_campaign_progress", self._max_campaign_progress)
+        self.logger.record("ground/ground_time_ratio", self._latest_ground_time_ratio)
 
         if self._episode_rewards:
             self.logger.record("rollout/ep_rew_mean", sum(self._episode_rewards) / len(self._episode_rewards))
@@ -378,16 +409,26 @@ class NESSMBTrainingStatsCallback(BaseCallback):
                 f"{name}:{count}"
                 for name, count in sorted(self._rollout_button_counts.items(), key=lambda item: (-item[1], item[0]))
             )
+            reward_summary = " ".join(
+                f"{name}:{total:+.1f}"
+                for name, total in sorted(
+                    self._rollout_reward_parts.items(),
+                    key=lambda item: (-abs(item[1]), item[0]),
+                )[:8]
+            )
             location = f"W{self._latest_world or 1}-{self._latest_level or 1}"
             reason = f" reason={self._last_termination_reason}" if self._last_termination_reason else ""
             print(
                 f"[NES-SMB] {location} x={self._latest_level_x} furthest_x={self._latest_furthest_x} "
                 f"best_campaign={self._max_campaign_progress}{reason} "
-                f"buttons[{button_summary or 'none'}] actions[{action_summary or 'none'}]"
+                f"ground_time={self._latest_ground_time_ratio:.2f} "
+                f"buttons[{button_summary or 'none'}] actions[{action_summary or 'none'}] "
+                f"rewards[{reward_summary or 'none'}]"
             )
 
         self._rollout_action_counts.clear()
         self._rollout_button_counts.clear()
+        self._rollout_reward_parts.clear()
         self._episode_rewards.clear()
         self._episode_lengths.clear()
         self._last_termination_reason = None

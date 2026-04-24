@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from collections import deque
 from pathlib import Path
 
@@ -9,6 +10,9 @@ import pytest
 from rl_zoo3.nes_smb_env import (
     RewardConfig,
     NESMarioBrosEnv,
+    ProgressTransition,
+    REWARD_FEATURE_FLAGS,
+    TerminationReason,
     action_tokens,
     build_metrics_from_ram,
     compute_reward_transition,
@@ -25,6 +29,14 @@ from rl_zoo3.nes_smb_env import (
     prune_jump_timer_window,
     progress_window_gain,
 )
+
+_PRESET_PATH = Path(__file__).resolve().parents[1] / "hyperparams/python/nes_smb_env_preset.py"
+_PRESET_SPEC = importlib.util.spec_from_file_location("nes_smb_env_preset", _PRESET_PATH)
+assert _PRESET_SPEC is not None and _PRESET_SPEC.loader is not None
+_PRESET = importlib.util.module_from_spec(_PRESET_SPEC)
+_PRESET_SPEC.loader.exec_module(_PRESET)
+TRAIN_ENV_KWARGS = _PRESET.TRAIN_ENV_KWARGS
+EVAL_ENV_KWARGS = _PRESET.EVAL_ENV_KWARGS
 
 
 def _make_ram() -> np.ndarray:
@@ -135,6 +147,21 @@ def test_furthest_progress_gain_direction_changes_and_timer_prune():
         furthest_gap=40,
         reward_config=RewardConfig(),
     )
+
+
+def test_reward_feature_flags_are_explicit():
+    assert "enable_jump_shaping" in REWARD_FEATURE_FLAGS
+    assert "enable_hop_spam_death" in REWARD_FEATURE_FLAGS
+    assert "enable_grounded_new_progress" in REWARD_FEATURE_FLAGS
+
+
+def test_env_preset_exposes_easy_toggles():
+    assert TRAIN_ENV_KWARGS["debug_rewards"] is True
+    assert TRAIN_ENV_KWARGS["enable_left_jump_actions"] is False
+    assert TRAIN_ENV_KWARGS["enable_hop_spam_death"] is False
+    assert TRAIN_ENV_KWARGS["render_mode"] == "human"
+    assert EVAL_ENV_KWARGS["render_mode"] == "rgb_array"
+    assert EVAL_ENV_KWARGS["random_noop_max"] == 0
 
 
 def test_compute_reward_transition_progress_and_coin():
@@ -259,6 +286,40 @@ def test_compute_reward_transition_penalizes_bad_jump_start_and_no_progress():
     assert transition.reward_parts["jump_start_penalty"] < 0
     assert transition.reward_parts["jump_no_progress_penalty"] < 0
     assert transition.reward_parts["jump_idle_penalty"] < 0
+
+
+def test_compute_reward_transition_can_disable_jump_shaping():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 120
+    ram_prev[0x0755] = 120
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+    ram_prev[0x0057] = 8
+
+    ram_curr[:] = ram_prev
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+    transition = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(enable_jump_shaping=False),
+        stagnation_steps=0,
+        jump_action_active=True,
+        jump_started=True,
+        grounded_run_steps=1,
+        avg_x_speed=9.0,
+        jump_no_progress_steps=3,
+        is_moving_right=False,
+        is_running_right=False,
+    )
+
+    assert "jump_start_penalty" not in transition.reward_parts
+    assert "jump_no_progress_penalty" not in transition.reward_parts
+    assert "jump_idle_penalty" not in transition.reward_parts
 
 
 def test_compute_reward_transition_rewards_grounded_run():
@@ -570,6 +631,139 @@ def test_compute_reward_transition_penalizes_hop_spam_death():
     assert transition.reward_parts["hop_spam_death_penalty"] == pytest.approx(-25.0)
 
 
+def test_compute_reward_transition_only_rewards_new_furthest_progress():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 40
+    ram_prev[0x0755] = 40
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+    ram_prev[0x07F8] = 4
+
+    ram_curr[:] = ram_prev
+    ram_curr[0x0086] = 30
+    ram_curr[0x0755] = 30
+    ram_curr[0x07F8] = 3
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+
+    transition = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(),
+        stagnation_steps=0,
+        progress_transition=ProgressTransition(
+            raw_delta=current.campaign_progress - previous.campaign_progress,
+            new_furthest_delta=0,
+            furthest_gap=10,
+            window_gain=10,
+            furthest_window_gain=0,
+        ),
+    )
+
+    assert "progress" not in transition.reward_parts
+
+
+def test_compute_reward_transition_rewards_new_furthest_progress():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 40
+    ram_prev[0x0755] = 40
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+    ram_prev[0x07F8] = 4
+
+    ram_curr[:] = ram_prev
+    ram_curr[0x0086] = 55
+    ram_curr[0x0755] = 55
+    ram_curr[0x07F8] = 3
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+
+    transition = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(),
+        stagnation_steps=0,
+        progress_transition=ProgressTransition(
+            raw_delta=current.campaign_progress - previous.campaign_progress,
+            new_furthest_delta=15,
+            furthest_gap=0,
+            window_gain=15,
+            furthest_window_gain=15,
+        ),
+    )
+
+    assert transition.reward_parts["progress"] > 0.0
+    progress_without_effective = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(),
+        stagnation_steps=0,
+    )
+    assert transition.reward_parts["progress"] == progress_without_effective.reward_parts["progress"]
+
+
+def test_compute_reward_transition_grounded_new_progress_bonus():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 40
+    ram_prev[0x0755] = 40
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+    ram_prev[0x07F8] = 4
+
+    ram_curr[:] = ram_prev
+    ram_curr[0x0086] = 52
+    ram_curr[0x0755] = 52
+    ram_curr[0x07F8] = 3
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+
+    grounded = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(grounded_new_progress_scale=0.02),
+        stagnation_steps=0,
+        progress_transition=ProgressTransition(
+            raw_delta=12,
+            new_furthest_delta=12,
+            furthest_gap=0,
+            window_gain=12,
+            furthest_window_gain=12,
+        ),
+    )
+
+    ram_curr[0x001D] = 1
+    airborne_current = build_metrics_from_ram(ram_curr)
+    airborne = compute_reward_transition(
+        previous,
+        airborne_current,
+        RewardConfig(grounded_new_progress_scale=0.02),
+        stagnation_steps=0,
+        progress_transition=ProgressTransition(
+            raw_delta=12,
+            new_furthest_delta=12,
+            furthest_gap=0,
+            window_gain=12,
+            furthest_window_gain=12,
+        ),
+    )
+
+    assert grounded.reward_parts["grounded_new_progress"] == pytest.approx(0.24)
+    assert "grounded_new_progress" not in airborne.reward_parts
+    assert grounded.reward_parts["progress"] > airborne.reward_parts["progress"]
+
+
 def test_progress_window_gain_and_jump_window_penalty():
     assert progress_window_gain([620, 624, 631, 629]) == 11
     assert progress_window_gain([]) == 0
@@ -579,7 +773,7 @@ def test_progress_window_gain_and_jump_window_penalty():
         jump_penalty_threshold=12,
         jump_penalty_scale=0.02,
         jump_action_active=True,
-        progress_delta=0,
+        productive_delta=0,
     )
     assert penalty == pytest.approx(0.16)
 
@@ -588,7 +782,7 @@ def test_progress_window_gain_and_jump_window_penalty():
         jump_penalty_threshold=12,
         jump_penalty_scale=0.02,
         jump_action_active=True,
-        progress_delta=8,
+        productive_delta=8,
     )
     assert productive_penalty == pytest.approx(0.08)
 
@@ -606,6 +800,24 @@ def test_action_tokens_filters_macro_suffix():
     assert action_tokens("right_a_b_long") == ("right", "a", "b")
 
 
+def test_can_disable_left_jump_actions_without_disabling_left_run():
+    env = NESMarioBrosEnv.__new__(NESMarioBrosEnv)
+    env.enable_long_jumps = True
+    env.enable_left_jump_actions = False
+    env.frames_per_action = 2
+    env.macro_jump_hold_frames = 6
+    env.macro_jump_release_frames = 1
+
+    action_names = tuple(spec.name for spec in env._build_action_specs())
+
+    assert "left" in action_names
+    assert "left_b" in action_names
+    assert "left_a" not in action_names
+    assert "left_a_b" not in action_names
+    assert "left_a_long" not in action_names
+    assert "left_a_b_long" not in action_names
+
+
 def test_derive_termination_reason():
     ram = _make_ram()
     ram[0x075A] = 1
@@ -613,7 +825,7 @@ def test_derive_termination_reason():
     ram[0x0770] = 1
     metrics = build_metrics_from_ram(ram)
 
-    terminated, truncated, reason = derive_termination_reason(
+    outcome = derive_termination_reason(
         metrics,
         RewardConfig(stagnation_steps=240),
         hop_spam_death=False,
@@ -624,15 +836,16 @@ def test_derive_termination_reason():
         stagnation_steps=0,
     )
 
-    assert terminated is True
-    assert truncated is False
-    assert reason == "death"
+    assert outcome.terminated is True
+    assert outcome.truncated is False
+    assert outcome.reason == TerminationReason.DEATH
+    assert outcome.reason_value == "death"
 
 
 def test_derive_termination_reason_hop_spam_death():
     metrics = build_metrics_from_ram(_make_ram())
 
-    terminated, truncated, reason = derive_termination_reason(
+    outcome = derive_termination_reason(
         metrics,
         RewardConfig(stagnation_steps=240),
         hop_spam_death=True,
@@ -643,9 +856,28 @@ def test_derive_termination_reason_hop_spam_death():
         stagnation_steps=0,
     )
 
-    assert terminated is True
-    assert truncated is False
-    assert reason == "hop_spam_death"
+    assert outcome.terminated is True
+    assert outcome.truncated is False
+    assert outcome.reason == TerminationReason.HOP_SPAM_DEATH
+
+
+def test_derive_termination_reason_can_disable_hop_spam_death():
+    metrics = build_metrics_from_ram(_make_ram())
+
+    outcome = derive_termination_reason(
+        metrics,
+        RewardConfig(enable_hop_spam_death=False, stagnation_steps=240),
+        hop_spam_death=True,
+        level_complete=False,
+        terminate_on_level_complete=False,
+        episode_steps=10,
+        max_episode_steps=12000,
+        stagnation_steps=0,
+    )
+
+    assert outcome.terminated is False
+    assert outcome.truncated is False
+    assert outcome.reason is None
 
 
 @pytest.mark.skipif(
