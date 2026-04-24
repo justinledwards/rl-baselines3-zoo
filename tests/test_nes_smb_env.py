@@ -96,7 +96,7 @@ def test_stagnation_event_includes_trace_fields():
     metrics = build_metrics_from_ram(ram)
 
     env = NESMarioBrosEnv.__new__(NESMarioBrosEnv)
-    env.reward_config = RewardConfig()
+    env.reward_config = RewardConfig(stagnation_event_steps=3)
     env._event_log = deque(maxlen=32)
     env._event_seq = 0
     env._seen_event_keys = set()
@@ -202,10 +202,10 @@ def test_compute_reward_transition_powerup_bonus():
     ram_prev[0x075A] = 2
     ram_prev[0x0770] = 1
     ram_prev[0x000E] = 8
-    ram_prev[0x000F] = 0
+    ram_prev[0x0756] = 0
 
     ram_curr[:] = ram_prev
-    ram_curr[0x000F] = 1
+    ram_curr[0x0756] = 1
 
     previous = build_metrics_from_ram(ram_prev)
     current = build_metrics_from_ram(ram_curr)
@@ -353,6 +353,44 @@ def test_compute_reward_transition_rewards_grounded_run():
     )
 
     assert transition.reward_parts["run_ground_bonus"] > 0
+
+
+def test_compute_reward_transition_does_not_reward_grounded_run_without_new_furthest_progress():
+    ram_prev = _make_ram()
+    ram_curr = _make_ram()
+
+    ram_prev[0x0086] = 120
+    ram_prev[0x0755] = 120
+    ram_prev[0x075A] = 2
+    ram_prev[0x0770] = 1
+    ram_prev[0x000E] = 8
+    ram_prev[0x0057] = 48
+    ram_prev[0x07F8] = 3
+
+    ram_curr[:] = ram_prev
+
+    previous = build_metrics_from_ram(ram_prev)
+    current = build_metrics_from_ram(ram_curr)
+    transition = compute_reward_transition(
+        previous,
+        current,
+        RewardConfig(),
+        stagnation_steps=0,
+        progress_transition=ProgressTransition(
+            raw_delta=0,
+            new_furthest_delta=0,
+            furthest_gap=0,
+            window_gain=0,
+            furthest_window_gain=0,
+        ),
+        grounded_run_steps=20,
+        avg_x_speed=48.0,
+        is_moving_right=True,
+        is_running_right=True,
+    )
+
+    assert "run_ground_bonus" not in transition.reward_parts
+    assert "full_speed_ground_bonus" not in transition.reward_parts
 
 
 def test_compute_reward_transition_rewards_full_speed_ground_run():
@@ -537,6 +575,30 @@ def test_nearest_enemy_ahead_detects_first_enemy():
     assert nearest is not None
     assert nearest["label"] == "goomba"
     assert nearest["dx"] == 24
+
+
+def test_nearest_enemy_ahead_uses_level_position_not_screen_position():
+    ram = _make_ram()
+    ram[0x006D] = 0
+    ram[0x0086] = 180
+    ram[0x0755] = 112
+    ram[0x0770] = 1
+    ram[0x000E] = 8
+    ram[0x000F] = 1
+    ram[0x0016] = 0x06
+    ram[0x001E] = 0x00
+    ram[0x006E] = 1
+    ram[0x0087] = 64
+    ram[0x00B6] = 1
+    ram[0x00CF] = 184
+
+    metrics = build_metrics_from_ram(ram)
+    nearest = nearest_enemy_ahead(metrics)
+
+    assert nearest is not None
+    assert nearest["label"] == "goomba"
+    assert nearest["level_x"] == 320
+    assert nearest["dx"] == 140
 
 
 def test_is_pipe_stall_detects_low_speed_wallup():

@@ -92,7 +92,7 @@ class SMBRamAddresses:
     player_y_screen: int = 0x00CE
     player_x_screen: int = 0x0755
     player_state: int = 0x000E
-    player_mode: int = 0x000F
+    player_mode: int = 0x0756
     enemy_drawn: tuple[int, ...] = (0x000F, 0x0010, 0x0011, 0x0012, 0x0013)
     enemy_types: tuple[int, ...] = (0x0016, 0x0017, 0x0018, 0x0019, 0x001A)
     enemy_states: tuple[int, ...] = (0x001E, 0x001F, 0x0020, 0x0021, 0x0022)
@@ -141,6 +141,7 @@ class RewardConfig:
     coin_bonus: float = 1.0
     powerup_bonus: float = 20.0
     stagnation_penalty: float = 1.0
+    stagnation_event_steps: int = 24
     stagnation_steps: int = 240
     stagnation_window: int = 48
     stagnation_min_progress: int = 24
@@ -546,7 +547,8 @@ def nearest_enemy_ahead(metrics: SMBRamMetrics) -> dict[str, int | str] | None:
         on_screen = drawn != 0 and label != "unknown" and y_viewport == 1 and 0 < x_screen < 255
         if not on_screen:
             continue
-        dx = x_screen - metrics.player_x_screen
+        enemy_level_x = page * 256 + x_screen
+        dx = enemy_level_x - metrics.level_progress
         if dx <= 0:
             continue
         candidate = {
@@ -557,6 +559,7 @@ def nearest_enemy_ahead(metrics: SMBRamMetrics) -> dict[str, int | str] | None:
             "enemy_state": enemy_state,
             "page": page,
             "x_screen": x_screen,
+            "level_x": enemy_level_x,
             "y_screen": y_screen,
         }
         if nearest is None or int(candidate["dx"]) < int(nearest["dx"]):
@@ -589,6 +592,7 @@ def behavior_reward_parts(
     current: SMBRamMetrics,
     reward_config: RewardConfig,
     progress_delta: int,
+    productive_delta: int,
     jump_action_active: bool,
     jump_started: bool,
     was_airborne: bool,
@@ -605,7 +609,7 @@ def behavior_reward_parts(
 ) -> dict[str, float]:
     reward_parts: dict[str, float] = {}
 
-    grounded_run = is_running_right and not jump_action_active and not current.airborne
+    grounded_run = is_running_right and not jump_action_active and not current.airborne and productive_delta > 0
     if reward_config.enable_run_ground_bonus and grounded_run and avg_x_speed > 12.0:
         streak_scale = min(1.0 + 0.15 * max(0, grounded_run_steps - 1), 2.5)
         grounded_run_bonus = streak_scale * (reward_config.run_ground_bonus + max(0.0, avg_x_speed - 16.0) * 0.004)
@@ -822,6 +826,7 @@ def compute_reward_transition(
             current=current,
             reward_config=reward_config,
             progress_delta=progress_delta,
+            productive_delta=progress_transition.new_furthest_delta,
             jump_action_active=jump_transition.action_active,
             jump_started=jump_transition.started,
             was_airborne=jump_transition.was_airborne,
@@ -995,6 +1000,7 @@ class NESMarioBrosEnv(gym.Env):
         enable_hop_spam_death: bool = True,
         airborne_progress_scale: float = 0.5,
         stagnation_steps: int = 240,
+        stagnation_event_steps: int = 24,
         stagnation_window: int = 48,
         stagnation_min_progress: int = 24,
         stagnation_furthest_min_progress: int = 12,
@@ -1093,6 +1099,7 @@ class NESMarioBrosEnv(gym.Env):
             enable_hop_spam_death=enable_hop_spam_death,
             airborne_progress_scale=airborne_progress_scale,
             stagnation_steps=stagnation_steps,
+            stagnation_event_steps=stagnation_event_steps,
             stagnation_window=stagnation_window,
             stagnation_min_progress=stagnation_min_progress,
             stagnation_furthest_min_progress=stagnation_furthest_min_progress,
@@ -1309,6 +1316,7 @@ class NESMarioBrosEnv(gym.Env):
                 "nearest_enemy": nearest_enemy,
                 "pipe_stall_detected": pipe_stall_detected,
                 "last_event": self._event_log[-1] if self._event_log else None,
+                "events": list(self._event_log),
                 "reward_parts": reward_parts,
                 "debug_reward_line": debug_reward_line,
                 "debug_reward_parts": significant_rewards,
@@ -1383,7 +1391,10 @@ class NESMarioBrosEnv(gym.Env):
             self._append_event("pipe_stall", metrics, x_speed=metrics.x_speed, **movement_trace_payload(self._movement_trace))
             self._seen_event_keys.add("pipe_stall")
 
-        if stagnation_steps > 0 and "stagnation_detected" not in self._seen_event_keys:
+        if (
+            stagnation_steps >= self.reward_config.stagnation_event_steps
+            and "stagnation_detected" not in self._seen_event_keys
+        ):
             self._append_event(
                 "stagnation_detected",
                 metrics,

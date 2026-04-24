@@ -44,6 +44,7 @@ STAGNATION_WINDOW = 48
 STAGNATION_MIN_PROGRESS = 24
 STAGNATION_FURTHEST_MIN_PROGRESS = 12
 STAGNATION_PENALTY = 1.0
+STAGNATION_EVENT_STEPS = 24
 OSCILLATION_PENALTY = 0.2
 
 # Jump-shaping settings.
@@ -124,6 +125,7 @@ BASE_ENV_KWARGS = dict(
     stagnation_min_progress=STAGNATION_MIN_PROGRESS,
     stagnation_furthest_min_progress=STAGNATION_FURTHEST_MIN_PROGRESS,
     stagnation_penalty=STAGNATION_PENALTY,
+    stagnation_event_steps=STAGNATION_EVENT_STEPS,
     oscillation_penalty=OSCILLATION_PENALTY,
     jump_penalty_window=JUMP_PENALTY_WINDOW,
     jump_penalty_threshold=JUMP_PENALTY_THRESHOLD,
